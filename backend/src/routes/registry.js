@@ -4,9 +4,7 @@ import {
   getService,
   getServiceCount,
   updateReputation,
-} from "../lib/contract.js";
-import logger from "../lib/logger.js";
-import { checkRpcHealth } from "../lib/stellar.js";
+
 
 const router = Router();
 
@@ -26,10 +24,7 @@ router.get("/services", async (req, res) => {
 
     res.json({ services, count: services.length });
   } catch (err) {
-    logger.error({ err }, "GET /api/services failed");
-    res
-      .status(500)
-      .json({ error: "Failed to fetch services", code: "FETCH_ERROR" });
+
   }
 });
 
@@ -49,10 +44,7 @@ router.get("/services/:id", async (req, res) => {
     }
     res.json(service);
   } catch (err) {
-    logger.error({ err, id: req.params.id }, "GET /api/services/:id failed");
-    res
-      .status(500)
-      .json({ error: "Failed to fetch service", code: "FETCH_ERROR" });
+
   }
 });
 
@@ -72,10 +64,7 @@ router.get("/stats", async (req, res) => {
 
     res.json({ totalServices, categories, latestService });
   } catch (err) {
-    logger.error({ err }, "GET /api/stats failed");
-    res
-      .status(500)
-      .json({ error: "Failed to fetch stats", code: "FETCH_ERROR" });
+
   }
 });
 
@@ -98,10 +87,7 @@ router.post("/reputation/:id", async (req, res) => {
     const newReputation = await updateReputation(id, positive);
     res.json({ success: true, newReputation });
   } catch (err) {
-    logger.error({ err, id: req.params.id }, "POST /api/reputation/:id failed");
-    res
-      .status(500)
-      .json({ error: "Failed to update reputation", code: "UPDATE_ERROR" });
+
   }
 });
 
