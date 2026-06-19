@@ -189,6 +189,72 @@ export async function getServiceCount() {
   }
 }
 
+async function activeServiceExists(provider, endpoint) {
+  let page = 0;
+  const pageSize = 20;
+
+  while (true) {
+    const services = await listServices({ page, pageSize });
+    if (!services.length) {
+      return false;
+    }
+
+    if (services.some((s) => s.provider === provider && s.endpoint === endpoint)) {
+      return true;
+    }
+
+    if (services.length < pageSize) {
+      return false;
+    }
+
+    page += 1;
+  }
+}
+
+/**
+ * Register a service on-chain.
+ * Rejects duplicate active service entries for the same provider and endpoint.
+ */
+export async function registerServiceOnChain(
+  name,
+  description,
+  endpoint,
+  priceUsdc,
+  category
+) {
+  try {
+    const contract = getContract();
+    const keypair = getServerKeypair();
+    const providerAddress = Address.fromString(keypair.publicKey());
+    const provider = providerAddress.toString();
+
+    if (await activeServiceExists(provider, endpoint)) {
+      const err = new Error(
+        'Active service with same provider and endpoint already exists'
+      );
+      logger.warn({ provider, endpoint }, 'Duplicate active service registration blocked');
+      throw err;
+    }
+
+    const op = contract.call(
+      'register_service',
+      nativeToScVal(providerAddress, { type: 'address' }),
+      nativeToScVal(name, { type: 'string' }),
+      nativeToScVal(description, { type: 'string' }),
+      nativeToScVal(endpoint, { type: 'string' }),
+      nativeToScVal(priceUsdc, { type: 'string' }),
+      nativeToScVal(category, { type: 'string' })
+    );
+
+    const result = await simulateAndSubmit(op);
+    const retval = result.returnValue;
+    return retval ? Number(scValToNative(retval)) : null;
+  } catch (err) {
+    logger.error({ err, name }, 'registerServiceOnChain failed');
+    throw err;
+  }
+}
+
 /**
  * Update a service's reputation on-chain and record the change history.
  * @param {number} id - The ID of the service to update
