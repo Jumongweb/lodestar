@@ -1,9 +1,9 @@
-import { vi, describe, it, expect } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../config.js', () => ({
   default: {
     contract: { id: 'mock', agentsId: 'mock' },
-    server: { address: 'mock', secret: 'mock' },
+    server: { address: 'mock', secret: 'SCUWRD6GQ3GE7DM4D6DXJEUKF6YYZHLFHUR7HDFMM3HEH2H3H3IPFYV4' },
     stellar: { network: 'testnet', rpcUrl: 'https://mock', networkPassphrase: 'mock', usdcContractId: 'mock' },
     x402: { facilitatorUrl: 'https://mock', searchPrice: '0.001', weatherPrice: '0.001' },
     braveApiKey: '',
@@ -15,7 +15,39 @@ vi.mock('../config.js', () => ({
   },
 }));
 
+import * as contractLib from './contract.js';
 import { mapAgent, mapPolicy } from './contract.js';
+
+describe('registerServiceOnChain duplicate checks', () => {
+  let listServicesSpy;
+
+  beforeEach(() => {
+    listServicesSpy = vi.spyOn(contractLib, 'listServices');
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('returns true when an active service exists for the same provider and endpoint', async () => {
+    const provider = 'GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ';
+    const endpoint = 'https://test.example.com';
+    listServicesSpy.mockResolvedValueOnce([
+      { provider, endpoint, active: true },
+    ]);
+
+    expect(await contractLib.activeServiceExists(provider, endpoint)).toBe(true);
+    expect(listServicesSpy).toHaveBeenCalled();
+  });
+
+  it('returns false when no matching active service exists', async () => {
+    listServicesSpy.mockResolvedValueOnce([
+      { provider: 'GAAAAA', endpoint: 'https://other.example.com', active: true },
+    ]);
+
+    expect(await contractLib.activeServiceExists('GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ', 'https://test.example.com')).toBe(false);
+  });
+});
 
 describe('mapAgent', () => {
   it('should map a basic agent object', () => {

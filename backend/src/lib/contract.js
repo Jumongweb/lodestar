@@ -189,7 +189,7 @@ export async function getServiceCount() {
   }
 }
 
-async function activeServiceExists(provider, endpoint) {
+export async function activeServiceExists(provider, endpoint) {
   let page = 0;
   const pageSize = 20;
 
