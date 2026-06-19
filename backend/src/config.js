@@ -51,6 +51,18 @@ const config = Object.freeze({
     : ['http://localhost:3000'],
 
   jsonBodyLimit: process.env.JSON_BODY_LIMIT ?? '100kb',
+
+  // Rate limiting for public write endpoints (anti-spam for on-chain writes).
+  rateLimit: {
+    // Generic limit applied to write routes (POST /reputation/:id, POST /agents/register).
+    windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? '60000', 10),
+    max: parseInt(process.env.RATE_LIMIT_MAX ?? '20', 10),
+    // Tighter, per-agent limit for the payment route.
+    payment: {
+      windowMs: parseInt(process.env.PAYMENT_RATE_LIMIT_WINDOW_MS ?? '60000', 10),
+      max: parseInt(process.env.PAYMENT_RATE_LIMIT_MAX ?? '10', 10),
+    },
+  },
 });
 
 export default config;
