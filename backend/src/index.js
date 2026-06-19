@@ -3,6 +3,7 @@ import cors from "cors";
 import config from "./config.js";
 import logger from "./lib/logger.js";
 import { checkRpcHealth } from "./lib/stellar.js";
+import { getSubmitQueueDepth } from "./lib/contract.js";
 import registryRouter from "./routes/registry.js";
 import servicesRouter from "./routes/services.js";
 import demoRouter from "./routes/demo.js";
@@ -21,6 +22,7 @@ app.use(express.json({ limit: config.jsonBodyLimit }));
 app.get("/healthz", async (_req, res) => {
   try {
     const health = await checkRpcHealth();
+    const queueDepth = getSubmitQueueDepth();
 
     // Determine HTTP status code based on health status
     let statusCode = 200;
@@ -35,6 +37,7 @@ app.get("/healthz", async (_req, res) => {
       rpc: health.rpc,
       contract: health.contract,
       timestamp: health.timestamp,
+      queueDepth,
       ...(health.error && { error: health.error }),
     });
   } catch (err) {
