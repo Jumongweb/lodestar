@@ -17,6 +17,7 @@ import config from '../config.js';
 import { ownerAuth } from '../middleware/ownerAuth.js';
 import { hmacAuth } from '../middleware/hmacAuth.js';
 import { paymentRateLimiter } from '../middleware/paymentRateLimiter.js';
+import { writeRateLimiter } from '../middleware/rateLimiter.js';
 import { validateAgentAddressParam, isValidStellarAddress } from '../middleware/addressValidator.js';
 import logger from '../lib/logger.js';
 import { handleContractError } from '../lib/ContractError.js';
@@ -214,7 +215,7 @@ router.get('/agents/:address/can-spend', requireAgentsContract, async (req, res)
 });
 
 // POST /api/agents/register — Body: { agentAddress, name, description }
-router.post('/agents/register', requireAgentsContract, async (req, res) => {
+router.post('/agents/register', requireAgentsContract, writeRateLimiter(), async (req, res) => {
   try {
     const { agentAddress, name, description } = req.body;
 
@@ -250,7 +251,7 @@ router.post(
   '/agents/:address/payment',
   requireAgentsContract,
   hmacAuth,
-  paymentRateLimiter(10, 60_000),
+  paymentRateLimiter(config.rateLimit.payment.max, config.rateLimit.payment.windowMs),
   async (req, res) => {
     const { address } = req.params;
 
