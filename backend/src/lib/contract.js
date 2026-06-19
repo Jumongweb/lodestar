@@ -13,12 +13,44 @@ const {
 import config from '../config.js';
 import { getStellarServer, getNetworkPassphrase } from './stellar.js';
 import logger from './logger.js';
+import { ContractError } from './ContractError.js';
+import { recordReputationChange } from './reputationHistory.js';
 
 
 const TIMEOUT = 30;
 
 function getContract() {
   return new Contract(config.contract.id);
+}
+
+/**
+ * Allowlist of demo-agent signing keys the backend may cast reputation votes
+ * with, keyed by public address. Built lazily from config so an invalid secret
+ * surfaces clearly instead of crashing module load. The on-chain contract is the
+ * real enforcement (require_auth + is_registered); this just bounds which agents
+ * the hosted backend is willing to act for.
+ */
+let reputationVoters = null;
+function getReputationVoters() {
+  if (reputationVoters) return reputationVoters;
+  reputationVoters = new Map();
+  for (const secret of config.demo.voterSecrets) {
+    try {
+      const kp = Keypair.fromSecret(secret);
+      reputationVoters.set(kp.publicKey(), kp);
+    } catch {
+      logger.warn('Skipping invalid reputation voter secret in config');
+    }
+  }
+  return reputationVoters;
+}
+
+/**
+ * Whether the hosted backend is permitted to sign a reputation vote on behalf
+ * of `agentAddress` (i.e. it holds that demo agent's key).
+ */
+export function isAllowedReputationAgent(agentAddress) {
+  return getReputationVoters().has(agentAddress);
 }
 
 function getAgentsContract() {
@@ -32,9 +64,9 @@ function getServerKeypair() {
   return Keypair.fromSecret(config.server.secret);
 }
 
-async function simulateAndSubmit(operation) {
+async function simulateAndSubmit(operation, signer) {
   const server = getStellarServer();
-  const keypair = getServerKeypair();
+  const keypair = signer ?? getServerKeypair();
   const passphrase = getNetworkPassphrase();
 
   const account = await server.getAccount(keypair.publicKey());
@@ -191,13 +223,27 @@ export async function getServiceCount() {
 
 /**
  * Update a service's reputation on-chain and record the change history.
+ *
+ * The vote is cast as `agentAddress`, which must be a registered agent the
+ * backend is allowed to sign for (see {@link isAllowedReputationAgent}). The
+ * on-chain contract independently enforces `require_auth` + agent registration +
+ * a per-(service, agent) cooldown, so this can never push an anonymous vote.
  * @param {number} id - The ID of the service to update
  * @param {boolean} positive - Whether to increase (true) or decrease (false) reputation by 1
+ * @param {string} agentAddress - Stellar address of the registered agent casting the vote
  * @returns {Promise<number>} The new reputation value
- * @throws {Error} If the contract call fails or service can't be read
+ * @throws {ContractError} If the agent is not permitted, or the contract call fails
  */
-export async function updateReputation(id, positive) {
+export async function updateReputation(id, positive, agentAddress) {
   try {
+    const voter = getReputationVoters().get(agentAddress);
+    if (!voter) {
+      throw new ContractError(
+        'This agent is not permitted to vote through the hosted backend. Only registered demo agents may; other agents must submit a wallet-signed transaction.',
+        'AGENT_NOT_ALLOWED'
+      );
+    }
+
     const before = await getService(id);
     if (!before) {
       throw new Error(`Service ${id} not found before reputation update`);
@@ -207,10 +253,11 @@ export async function updateReputation(id, positive) {
     const op = contract.call(
       'update_reputation',
       nativeToScVal(BigInt(id), { type: 'u64' }),
-      nativeToScVal(positive, { type: 'bool' })
+      nativeToScVal(positive, { type: 'bool' }),
+      nativeToScVal(Address.fromString(agentAddress), { type: 'address' })
     );
-    await simulateAndSubmit(op);
-    
+    await simulateAndSubmit(op, voter);
+
     const after = await getService(id);
     if (!after) {
       throw new Error(`Failed to read updated reputation for service ${id}`);

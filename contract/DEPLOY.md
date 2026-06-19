@@ -95,6 +95,29 @@ AGENTS_CONTRACT_ID=<paste agent contract id here>
 NEXT_PUBLIC_AGENT_CONTRACT_ID=<paste agent contract id here>
 ```
 
+## 9b. Link the registry to the agents contract (required for reputation voting)
+
+Reputation voting is authorized on-chain: `update_reputation` verifies the voter
+is a registered agent via a cross-contract call to the agents contract. Wire the
+two together once, immediately after both are deployed:
+
+```sh
+stellar contract invoke \
+  --id <REGISTRY_CONTRACT_ID> \
+  --source deployer \
+  --network testnet \
+  -- init --agents_contract <AGENTS_CONTRACT_ID>
+```
+
+`init` can only be called once. Until it runs, `update_reputation` reverts, so no
+reputation can be written.
+
+The hosted backend casts reputation votes as a registered demo agent — by
+default its own server key (`SERVER_STELLAR_ADDRESS`), which `npm run seed-agents`
+registers as an agent. Set `NEXT_PUBLIC_DEMO_AGENT_ADDRESS` (frontend) to that
+address. To let other pre-funded demo agents vote, add their secrets to
+`DEMO_VOTER_SECRETS` (backend).
+
 ## 10. (Optional) Set demo agent secrets
 
 Generate three funded testnet keypairs for richer seed data:

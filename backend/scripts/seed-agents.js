@@ -1,12 +1,32 @@
 import 'dotenv/config';
 import pkg from '@stellar/stellar-sdk';
 const { Keypair } = pkg;
-import { getAgentCount, registerAgentOnChain, recordPaymentOnChain } from '../src/lib/contract.js';
+import { getAgentCount, getAgent, registerAgentOnChain, recordPaymentOnChain } from '../src/lib/contract.js';
+import config from '../src/config.js';
 import logger from '../src/lib/logger.js';
 
 if (!process.env.AGENTS_CONTRACT_ID) {
   logger.error('AGENTS_CONTRACT_ID not set — deploy the agents contract first');
   process.exit(1);
+}
+
+// Register the server key as an agent so it can cast reputation votes for the
+// demo (the backend signs reputation votes with this key by default — see
+// config.demo.voterSecrets). Idempotent: skips if already registered.
+async function ensureServerVoterRegistered() {
+  const address = config.server.address;
+  try {
+    const existing = await getAgent(address);
+    if (existing) {
+      logger.info({ address }, 'Server voter agent already registered — skipping');
+      return;
+    }
+    logger.info({ address }, 'Registering server key as reputation voter agent…');
+    await registerAgentOnChain(address, 'Lodestar Demo Voter', 'Backend demo agent used to cast reputation votes.');
+    logger.info({ address }, 'Server voter agent registered');
+  } catch (err) {
+    logger.error({ err, address }, 'Failed to register server voter agent');
+  }
 }
 
 // Use env secrets if provided, otherwise generate ephemeral keypairs.
@@ -49,6 +69,9 @@ const AGENTS = [
 
 async function seed() {
   try {
+    // Always ensure the demo voter exists, even if the demo agents are seeded.
+    await ensureServerVoterRegistered();
+
     const count = await getAgentCount();
     logger.info({ count }, 'Current agent count');
 
