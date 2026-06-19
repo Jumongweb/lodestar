@@ -31,11 +31,17 @@ export default function RegistryPage() {
 
   // SWR replaces the manual setInterval poll: it dedupes concurrent requests,
   // revalidates every 30s, and only re-renders when the returned data changes.
-  const { data: services = [], isLoading: loading } = useSWR(
+  const { data: services = [], isLoading: loading, error: swrError, mutate } = useSWR(
     ['services', activeCategory],
     () => fetchServices(activeCategory === 'all' ? undefined : activeCategory),
     { refreshInterval: 30_000, revalidateOnFocus: false, keepPreviousData: true }
   );
+
+  const error = swrError
+    ? swrError instanceof Error
+      ? swrError.message
+      : 'Failed to load'
+    : null;
 
   const sorted = sortServices(services, sort);
   const filtered = filterServices(sorted, query);
@@ -94,6 +100,17 @@ export default function RegistryPage() {
           {Array.from({ length: 4 }).map((_, i) => (
             <ServiceCardSkeleton key={i} />
           ))}
+        </div>
+      ) : error && services.length === 0 ? (
+        <div className="card p-8 text-center">
+          <p className="text-error text-sm mb-2">{error}</p>
+          <button
+            onClick={() => mutate()}
+            aria-label="Retry"
+            className="mt-3 px-4 py-2 text-sm rounded-lg border border-border bg-background hover:bg-border/40 transition-colors"
+          >
+            Retry
+          </button>
         </div>
       ) : filtered.length === 0 ? (
         <div className="text-center py-24 text-secondary">

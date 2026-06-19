@@ -38,7 +38,10 @@ export default function AgentsPage() {
     { refreshInterval: 30_000, revalidateOnFocus: false, keepPreviousData: true }
   );
 
-  const { data: stats = null } = useSWR<AgentStats>(
+  // Stats failure is intentionally tolerated (the original code used
+  // Promise.allSettled and only set stats on success) — a stats error must not
+  // block the agent grid. We still expose mutateStats so Retry revalidates both.
+  const { data: stats = null, mutate: mutateStats } = useSWR<AgentStats>(
     'agent-stats',
     () => fetchAgentStats(),
     { refreshInterval: 30_000, revalidateOnFocus: false, keepPreviousData: true }
@@ -159,7 +162,7 @@ export default function AgentsPage() {
             </p>
           ) : (
             <button
-              onClick={() => mutate()}
+              onClick={() => { mutate(); mutateStats(); }}
               aria-label="Retry"
               className="mt-3 px-4 py-2 text-sm rounded-lg border border-border bg-background hover:bg-border/40 transition-colors"
             >
