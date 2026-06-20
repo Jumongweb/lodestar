@@ -25,8 +25,11 @@ function loadFeed() {
   ensureDataDir();
   if (!existsSync(FEED_FILE)) return [];
   const raw = readFileSync(FEED_FILE, 'utf-8');
-  const parsed = JSON.parse(raw); // let parse errors bubble up
-  return Array.isArray(parsed) ? parsed : [];
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    throw new Error(`[activityFeed] Feed file contains invalid format: expected array, got ${typeof parsed}`);
+  }
+  return parsed;
 }
 
 function saveFeed(feed) {
