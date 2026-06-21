@@ -5,6 +5,7 @@
  * @param {() => Array<{ txHash?: string }>} getFeed
  * @param {number} activityCountBefore
  * @param {{ maxWaitMs: number, initialDelayMs: number, maxDelayMs: number }} options
+ * @param {(entry: { txHash?: string }) => boolean} [matchesEntry]
  * @param {(ms: number) => Promise<void>} [sleep]
  * @returns {Promise<string>}
  */
@@ -12,6 +13,7 @@ export async function waitForActivityTxHash(
   getFeed,
   activityCountBefore,
   { maxWaitMs, initialDelayMs, maxDelayMs },
+  matchesEntry,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 ) {
   let elapsedMs = 0;
@@ -19,9 +21,13 @@ export async function waitForActivityTxHash(
 
   while (true) {
     const feed = getFeed();
-    const newest = feed[0];
-    if (feed.length > activityCountBefore && newest?.txHash) {
-      return newest.txHash;
+    const addedCount = Math.max(feed.length - activityCountBefore, 0);
+    if (addedCount > 0) {
+      const recentEntries = feed.slice(0, addedCount);
+      const matched = recentEntries.find(
+        (entry) => entry?.txHash && (!matchesEntry || matchesEntry(entry)),
+      );
+      if (matched) return matched.txHash;
     }
 
     if (elapsedMs >= maxWaitMs) {

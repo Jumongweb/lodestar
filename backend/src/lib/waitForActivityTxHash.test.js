@@ -9,6 +9,8 @@ function makeSleepRecorder() {
   return { sleep, delays };
 }
 
+const defaultOptions = { maxWaitMs: 8000, initialDelayMs: 250, maxDelayMs: 2000 };
+
 describe('waitForActivityTxHash', () => {
   it('returns immediately when the feed already contains a new txHash', async () => {
     const { sleep, delays } = makeSleepRecorder();
@@ -20,7 +22,8 @@ describe('waitForActivityTxHash', () => {
     const result = await waitForActivityTxHash(
       getFeed,
       1,
-      { maxWaitMs: 8000, initialDelayMs: 250, maxDelayMs: 2000 },
+      defaultOptions,
+      undefined,
       sleep,
     );
 
@@ -42,7 +45,8 @@ describe('waitForActivityTxHash', () => {
     const result = await waitForActivityTxHash(
       getFeed,
       1,
-      { maxWaitMs: 8000, initialDelayMs: 250, maxDelayMs: 2000 },
+      defaultOptions,
+      undefined,
       sleep,
     );
 
@@ -66,6 +70,7 @@ describe('waitForActivityTxHash', () => {
       getFeed,
       1,
       { maxWaitMs: 10_000, initialDelayMs: 1000, maxDelayMs: 1500 },
+      undefined,
       sleep,
     );
 
@@ -82,6 +87,7 @@ describe('waitForActivityTxHash', () => {
       getFeed,
       5,
       { maxWaitMs: 1000, initialDelayMs: 250, maxDelayMs: 500 },
+      undefined,
       sleep,
     );
 
@@ -89,5 +95,30 @@ describe('waitForActivityTxHash', () => {
     const totalSlept = delays.reduce((sum, d) => sum + d, 0);
     expect(totalSlept).toBeLessThanOrEqual(1000);
     expect(delays.length).toBeGreaterThan(0);
+  });
+
+  it('ignores unrelated new entries when a matcher is provided', async () => {
+    const { sleep, delays } = makeSleepRecorder();
+    const myId = 'request-a';
+    const feeds = [
+      [{ txHash: 'other-hash', demoRunId: 'request-b' }],
+      [
+        { txHash: 'my-hash', demoRunId: myId },
+        { txHash: 'other-hash', demoRunId: 'request-b' },
+      ],
+    ];
+    const getFeed = vi.fn(() => feeds.shift() ?? feeds[feeds.length - 1]);
+
+    const result = await waitForActivityTxHash(
+      getFeed,
+      0,
+      defaultOptions,
+      (entry) => entry.demoRunId === myId,
+      sleep,
+    );
+
+    expect(result).toBe('my-hash');
+    expect(getFeed).toHaveBeenCalledTimes(2);
+    expect(delays).toEqual([250]);
   });
 });

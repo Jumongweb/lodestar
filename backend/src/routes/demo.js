@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { randomUUID } from 'node:crypto';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import { createEd25519Signer } from '@x402/stellar';
 import { ExactStellarScheme } from '@x402/stellar/exact/client';
@@ -64,6 +65,11 @@ router.post('/demo-run', async (req, res) => {
       endpointUrl += '?q=Stellar+blockchain+AI+agents';
     }
 
+    const demoRunId = randomUUID();
+    const endpoint = new URL(endpointUrl);
+    endpoint.searchParams.set('demoRunId', demoRunId);
+    endpointUrl = endpoint.toString();
+
     const httpClient = buildHttpClient();
     const activityCountBefore = getActivityFeed().length;
 
@@ -79,6 +85,7 @@ router.post('/demo-run', async (req, res) => {
       getActivityFeed,
       activityCountBefore,
       config.demoRun,
+      (entry) => entry.demoRunId === demoRunId,
     );
     if (!txHash) {
       logger.warn(
