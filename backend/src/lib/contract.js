@@ -189,6 +189,74 @@ export async function getServiceCount() {
   }
 }
 
+export const contractHelpers = {
+  activeServiceExists: async function (provider, endpoint, fetchServices = listServices) {
+    let page = 0;
+    const pageSize = 20;
+
+    while (true) {
+      const services = await fetchServices({ page, pageSize });
+      if (!services.length) {
+        return false;
+      }
+
+      if (services.some((s) => s.provider === provider && s.endpoint === endpoint)) {
+        return true;
+      }
+
+      page += 1;
+    }
+  },
+};
+
+export async function activeServiceExists(provider, endpoint, fetchServices = listServices) {
+  return contractHelpers.activeServiceExists(provider, endpoint, fetchServices);
+}
+
+/**
+ * Register a service on-chain.
+ * Rejects duplicate active service entries for the same provider and endpoint.
+ */
+export async function registerServiceOnChain(
+  name,
+  description,
+  endpoint,
+  priceUsdc,
+  category
+) {
+  try {
+    const keypair = getServerKeypair();
+    const providerAddress = Address.fromString(keypair.publicKey());
+    const provider = providerAddress.toString();
+
+    if (await contractHelpers.activeServiceExists(provider, endpoint)) {
+      const err = new Error(
+        'Active service with same provider and endpoint already exists'
+      );
+      logger.warn({ provider, endpoint }, 'Duplicate active service registration blocked');
+      throw err;
+    }
+
+    const contract = getContract();
+    const op = contract.call(
+      'register_service',
+      nativeToScVal(providerAddress, { type: 'address' }),
+      nativeToScVal(name, { type: 'string' }),
+      nativeToScVal(description, { type: 'string' }),
+      nativeToScVal(endpoint, { type: 'string' }),
+      nativeToScVal(priceUsdc, { type: 'string' }),
+      nativeToScVal(category, { type: 'string' })
+    );
+
+    const result = await simulateAndSubmit(op);
+    const retval = result.returnValue;
+    return retval ? Number(scValToNative(retval)) : null;
+  } catch (err) {
+    logger.error({ err, name }, 'registerServiceOnChain failed');
+    throw err;
+  }
+}
+
 /**
  * Update a service's reputation on-chain and record the change history.
  * @param {number} id - The ID of the service to update
@@ -224,37 +292,6 @@ export async function updateReputation(id, positive) {
     return newReputation;
   } catch (err) {
     logger.error({ err, id, positive }, 'updateReputation failed');
-    throw err;
-  }
-}
-
-export async function registerServiceOnChain(
-  name,
-  description,
-  endpoint,
-  priceUsdc,
-  category
-) {
-  try {
-    const contract = getContract();
-    const keypair = getServerKeypair();
-    const providerAddress = Address.fromString(keypair.publicKey());
-
-    const op = contract.call(
-      'register_service',
-      nativeToScVal(providerAddress, { type: 'address' }),
-      nativeToScVal(name, { type: 'string' }),
-      nativeToScVal(description, { type: 'string' }),
-      nativeToScVal(endpoint, { type: 'string' }),
-      nativeToScVal(priceUsdc, { type: 'string' }),
-      nativeToScVal(category, { type: 'string' })
-    );
-
-    const result = await simulateAndSubmit(op);
-    const retval = result.returnValue;
-    return retval ? Number(scValToNative(retval)) : null;
-  } catch (err) {
-    logger.error({ err, name }, 'registerServiceOnChain failed');
     throw err;
   }
 }
