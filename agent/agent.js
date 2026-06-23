@@ -23,6 +23,7 @@ const AGENT_DESC       = process.env.AGENT_DESC ?? 'Autonomous x402 agent powere
 const MAX_PER_TX       = process.env.AGENT_MAX_PER_TX ?? '0.001';
 const MAX_PER_DAY      = process.env.AGENT_MAX_PER_DAY ?? '1.00';
 const ALLOWED_CATS     = (process.env.AGENT_ALLOWED_CATEGORIES ?? '').split(',').filter(Boolean);
+const PRICE_TOLERANCE_PERCENT = parseFloat(process.env.AGENT_PRICE_TOLERANCE_PERCENT ?? '0');
 
 const agentKeypair = Keypair.fromSecret(AGENT_SECRET);
 const AGENT_ADDRESS = agentKeypair.publicKey();
@@ -126,38 +127,23 @@ async function recordOutcome(amountUsdc, success, serviceId) {
   }
 }
 
-// ── x402 client ───────────────────────────────────────────────────────────────
+// ── x402 helpers ──────────────────────────────────────────────────────────────
 
 function buildHttpClient() {
   const signer = createEd25519Signer(AGENT_SECRET, 'stellar:testnet');
   const scheme = new ExactStellarScheme(signer, { url: RPC_URL });
   const x402 = new x402Client().register('stellar:*', scheme);
-  const httpClient = new x402HTTPClient(x402);
+  return new x402HTTPClient(x402);
+}
 
-  // Implement fetch manually — x402HTTPClient.fetch() was removed in this version
-  httpClient.fetch = async (url, init = {}) => {
-    // Step 1: probe the endpoint
-    const probe = await fetch(url, init);
-    if (probe.status !== 402) return probe;
+const STROOPS_PER_USDC = 10_000_000;
 
-    // Step 2: decode the 402 payment-required header
-    const paymentRequired = httpClient.getPaymentRequiredResponse(
-      (name) => probe.headers.get(name),
-      probe.status === 402 ? await probe.json().catch(() => undefined) : undefined
-    );
+function stroopsToUsdcStr(stroops) {
+  return String(Number(stroops) / STROOPS_PER_USDC);
+}
 
-    // Step 3: build and sign the payment payload
-    const paymentPayload = await httpClient.createPaymentPayload(paymentRequired);
-
-    // Step 4: encode as header and retry
-    const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
-    return fetch(url, {
-      ...init,
-      headers: { ...(init.headers ?? {}), ...paymentHeaders },
-    });
-  };
-
-  return httpClient;
+function usdcStrToStroops(usdcStr) {
+  return BigInt(Math.round(parseFloat(usdcStr) * STROOPS_PER_USDC));
 }
 
 // ── Registry helpers ──────────────────────────────────────────────────────────
@@ -205,9 +191,51 @@ async function runTask(category, buildUrl, scoringEnabled) {
   const best = [...services].sort((a, b) => b.reputation - a.reputation)[0];
   logger.info(`${tag()} Step 3: Selected "${best.name}" — $${best.price_usdc} USDC`);
 
-  // Spending policy check
+  const endpointUrl = buildUrl(best.endpoint);
+  logger.info(`${tag()} Step 4: Sending x402 probe…`);
+
+  const httpClient = buildHttpClient();
+
+  // Step 4a: probe the endpoint
+  let probe;
+  try {
+    probe = await fetch(endpointUrl);
+  } catch (err) {
+    logger.error({ err }, `${tag()} x402 probe failed`);
+    if (scoringEnabled) await recordOutcome(best.price_usdc, false, best.id);
+    return;
+  }
+  if (probe.status !== 402) {
+    logger.error({ status: probe.status }, `${tag()} Expected 402, got ${probe.status}`);
+    if (scoringEnabled) await recordOutcome(best.price_usdc, false, best.id);
+    return;
+  }
+
+  // Step 4b: decode the 402 payment-required response
+  const paymentRequired = httpClient.getPaymentRequiredResponse(
+    (name) => probe.headers.get(name),
+    await probe.json().catch(() => undefined)
+  );
+
+  // Step 4c: verify the demanded price against the registered price
+  const demandedStroops = BigInt(paymentRequired.accepts[0].amount);
+  const demandedUsdc = stroopsToUsdcStr(demandedStroops);
+  const registeredStroops = usdcStrToStroops(best.price_usdc);
+  const maxAllowedStroops = registeredStroops * BigInt(Math.round((100 + PRICE_TOLERANCE_PERCENT) * 100)) / 10000n;
+
+  if (demandedStroops > maxAllowedStroops) {
+    logger.warn(
+      { registeredPrice: best.price_usdc, demandedPrice: demandedUsdc, serviceId: best.id },
+      `${tag()} Payment aborted — demanded price exceeds registered price`
+    );
+    if (scoringEnabled) await recordOutcome(demandedUsdc, false, best.id);
+    return;
+  }
+  logger.info(`${tag()} Price verified — demanded $${demandedUsdc} USDC (registered $${best.price_usdc} USDC)`);
+
+  // Step 4d: spending policy check against the actual demanded price (closes TOCTOU gap)
   if (scoringEnabled) {
-    const check = await checkSpend(best.price_usdc, category);
+    const check = await checkSpend(demandedUsdc, category);
     if (!check.allowed) {
       logger.warn(`${tag()} Payment blocked by spending policy: ${check.reason}`);
       return;
@@ -215,22 +243,30 @@ async function runTask(category, buildUrl, scoringEnabled) {
     logger.info(`${tag()} Spending policy check passed`);
   }
 
-  const endpointUrl = buildUrl(best.endpoint);
-  logger.info(`${tag()} Step 4: Sending x402 payment on Stellar…`);
+  // Step 4e: build and sign the payment payload
+  let paymentPayload;
+  try {
+    paymentPayload = await httpClient.createPaymentPayload(paymentRequired);
+  } catch (err) {
+    logger.error({ err }, `${tag()} Payment creation failed`);
+    if (scoringEnabled) await recordOutcome(demandedUsdc, false, best.id);
+    return;
+  }
 
-  const httpClient = buildHttpClient();
+  // Step 4f: encode as header and retry
+  const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
   let response;
   try {
-    response = await httpClient.fetch(endpointUrl);
+    response = await fetch(endpointUrl, { headers: paymentHeaders });
   } catch (err) {
     logger.error({ err }, `${tag()} x402 payment failed`);
-    if (scoringEnabled) await recordOutcome(best.price_usdc, false, best.id);
+    if (scoringEnabled) await recordOutcome(demandedUsdc, false, best.id);
     return;
   }
 
   if (!response.ok) {
     logger.error({ status: response.status }, `${tag()} Service error after payment`);
-    if (scoringEnabled) await recordOutcome(best.price_usdc, false, best.id);
+    if (scoringEnabled) await recordOutcome(demandedUsdc, false, best.id);
     return;
   }
 
@@ -238,9 +274,9 @@ async function runTask(category, buildUrl, scoringEnabled) {
   logger.info(`${tag()} Step 5: Payment confirmed — tx: ${txHash}`);
 
   const data = await response.json();
-  logger.info({ data }, `${tag()} Paid $${best.price_usdc} USDC — data received`);
+  logger.info({ data }, `${tag()} Paid $${demandedUsdc} USDC — data received`);
 
-  if (scoringEnabled) await recordOutcome(best.price_usdc, true, best.id);
+  if (scoringEnabled) await recordOutcome(demandedUsdc, true, best.id);
 
   await submitReputation(best.id, true);
   logger.info(`${tag()} Submitted positive reputation for "${best.name}"`);
