@@ -19,11 +19,7 @@ const AGENT_SECRET         = process.env.AGENT_STELLAR_SECRET;
 const RPC_URL              = process.env.STELLAR_RPC_URL;
 const LODESTAR_API_URL     = process.env.LODESTAR_API_URL;
 const LODESTAR_HMAC_SECRET = process.env.LODESTAR_HMAC_SECRET ?? '';
-const AGENT_NAME           = process.env.AGENT_NAME ?? 'LodestarAgent';
-const AGENT_DESC           = process.env.AGENT_DESC ?? 'Autonomous x402 agent powered by Lodestar service discovery';
-const MAX_PER_TX           = process.env.AGENT_MAX_PER_TX ?? '0.001';
-const MAX_PER_DAY          = process.env.AGENT_MAX_PER_DAY ?? '1.00';
-const ALLOWED_CATS         = (process.env.AGENT_ALLOWED_CATEGORIES ?? '').split(',').filter(Boolean);
+
 
 const agentKeypair = Keypair.fromSecret(AGENT_SECRET);
 const AGENT_ADDRESS = agentKeypair.publicKey();
@@ -159,38 +155,23 @@ async function recordOutcome(amountUsdc, success, serviceId) {
   }
 }
 
-// ── x402 client ───────────────────────────────────────────────────────────────
+// ── x402 helpers ──────────────────────────────────────────────────────────────
 
 function buildHttpClient() {
   const signer = createEd25519Signer(AGENT_SECRET, 'stellar:testnet');
   const scheme = new ExactStellarScheme(signer, { url: RPC_URL });
   const x402 = new x402Client().register('stellar:*', scheme);
-  const httpClient = new x402HTTPClient(x402);
+  return new x402HTTPClient(x402);
+}
 
-  // Implement fetch manually — x402HTTPClient.fetch() was removed in this version
-  httpClient.fetch = async (url, init = {}) => {
-    // Step 1: probe the endpoint
-    const probe = await fetch(url, init);
-    if (probe.status !== 402) return probe;
+const STROOPS_PER_USDC = 10_000_000;
 
-    // Step 2: decode the 402 payment-required header
-    const paymentRequired = httpClient.getPaymentRequiredResponse(
-      (name) => probe.headers.get(name),
-      probe.status === 402 ? await probe.json().catch(() => undefined) : undefined
-    );
+function stroopsToUsdcStr(stroops) {
+  return String(Number(stroops) / STROOPS_PER_USDC);
+}
 
-    // Step 3: build and sign the payment payload
-    const paymentPayload = await httpClient.createPaymentPayload(paymentRequired);
-
-    // Step 4: encode as header and retry
-    const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
-    return fetch(url, {
-      ...init,
-      headers: { ...(init.headers ?? {}), ...paymentHeaders },
-    });
-  };
-
-  return httpClient;
+function usdcStrToStroops(usdcStr) {
+  return BigInt(Math.round(parseFloat(usdcStr) * STROOPS_PER_USDC));
 }
 
 // ── Registry helpers ──────────────────────────────────────────────────────────
@@ -250,8 +231,9 @@ export async function runTask(category, buildUrl, scoringEnabled) {
     'Service selected'
   );
 
+
   if (scoringEnabled) {
-    const check = await checkSpend(best.price_usdc, category);
+    const check = await checkSpend(demandedUsdc, category);
     if (!check.allowed) {
       logger.warn(
         {
@@ -272,54 +254,20 @@ export async function runTask(category, buildUrl, scoringEnabled) {
     );
   }
 
-  const endpointUrl = buildUrl(best.endpoint);
-  logger.debug(
-    { event: EVENT.TASK_START, category, serviceId: best.id, endpointUrl },
-    'Sending x402 payment on Stellar'
-  );
 
-  const httpClient = buildHttpClient();
+
+  // Step 4f: encode as header and retry
+  const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
   let response;
   try {
-    response = await httpClient.fetch(endpointUrl);
+    response = await fetch(endpointUrl, { headers: paymentHeaders });
   } catch (err) {
-    logger.error(
-      { event: EVENT.PAYMENT_FAILED, category, serviceId: best.id, serviceName: best.name, priceUsdc: best.price_usdc, err },
-      'x402 payment failed'
-    );
-    if (scoringEnabled) await recordOutcome(best.price_usdc, false, best.id);
-    return { success: false, priceUsdc: best.price_usdc };
-  }
 
-  if (!response.ok) {
-    logger.error(
-      { event: EVENT.PAYMENT_FAILED, category, serviceId: best.id, serviceName: best.name, priceUsdc: best.price_usdc, httpStatus: response.status },
-      'Service error after payment'
-    );
-    if (scoringEnabled) await recordOutcome(best.price_usdc, false, best.id);
-    return { success: false, priceUsdc: best.price_usdc };
   }
 
   const txHash = response.headers.get('x-payment-transaction') ?? '(no hash)';
   const data = await response.json();
-  const taskDurationMs = Date.now() - taskStart;
 
-  logger.info(
-    {
-      event: EVENT.PAYMENT_SUCCESS,
-      category,
-      serviceId: best.id,
-      serviceName: best.name,
-      priceUsdc: best.price_usdc,
-      txHash,
-      scoreBefore: currentScore,
-      taskDurationMs,
-    },
-    'Payment completed'
-  );
-  logger.debug({ data }, 'Response data received');
-
-  if (scoringEnabled) await recordOutcome(best.price_usdc, true, best.id);
   await submitReputation(best.id, true);
 
   return { success: true, priceUsdc: best.price_usdc };
