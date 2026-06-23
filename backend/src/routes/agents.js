@@ -39,6 +39,11 @@ const AGENTS_CACHE_TTL = 30_000;
 
 const CACHE_BATCH_SIZE = 50;
 
+export function _resetCache() {
+  agentsCache = null;
+  agentsCacheTime = 0;
+}
+
 async function getCachedAgents() {
   const now = Date.now();
   if (agentsCache && now - agentsCacheTime < AGENTS_CACHE_TTL) return agentsCache;

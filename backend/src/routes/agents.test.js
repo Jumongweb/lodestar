@@ -77,6 +77,7 @@ vi.mock('../middleware/addressValidator.js', () => ({
 
 // Reset idempotency store between tests so keys don't bleed across cases
 import { _reset as resetIdempotencyStore } from '../lib/idempotency.js';
+import { _resetCache } from './agents.js';
 
 function signBody(body) {
   return crypto
@@ -97,6 +98,7 @@ beforeAll(async () => {
 beforeEach(() => {
   vi.clearAllMocks();
   resetIdempotencyStore();
+  _resetCache();
 });
 
 function makeAgent(overrides = {}) {
