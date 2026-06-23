@@ -39,8 +39,7 @@ let agentsCache = null;
 let agentsCacheTime = 0;
 const AGENTS_CACHE_TTL = 30_000;
 
-/** Test helper — reset cache so tests don't bleed into each other */
-export function _resetAgentsCache() {
+
   agentsCache = null;
   agentsCacheTime = 0;
 }
