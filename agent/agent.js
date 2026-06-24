@@ -210,9 +210,28 @@ async function submitReputation(id, positive) {
   }).catch(() => {});
 }
 
+// Weighted random selection: higher reputation = proportionally more likely to be chosen.
+// Falls back to uniform random when all weights are zero.
+function selectWeighted(services) {
+  const weights = services.map(s => Math.max(0, s.reputation));
+  const total = weights.reduce((sum, w) => sum + w, 0);
+  if (total === 0) {
+    return services[Math.floor(Math.random() * services.length)];
+  }
+  let r = Math.random() * total;
+  for (let i = 0; i < services.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return services[i];
+  }
+  return services[services.length - 1];
+}
+
 // ── Agent task ────────────────────────────────────────────────────────────────
 
 export async function runTask(category, buildUrl, scoringEnabled) {
+  const minReputation = parseInt(process.env.AGENT_MIN_SERVICE_REPUTATION ?? '0', 10);
+  const maxRetries    = parseInt(process.env.AGENT_MAX_SERVICE_RETRIES    ?? '3', 10);
+
   const taskStart = Date.now();
   logger.info({ event: EVENT.TASK_START, category, agentAddress: AGENT_ADDRESS }, 'Task started');
 
@@ -226,92 +245,123 @@ export async function runTask(category, buildUrl, scoringEnabled) {
     return { success: false, priceUsdc: null };
   }
 
-  const best = [...services].sort((a, b) => b.reputation - a.reputation)[0];
-  logger.info(
-    {
-      event: EVENT.SERVICE_SELECTED,
-      category,
-      serviceId: best.id,
-      serviceName: best.name,
-      priceUsdc: best.price_usdc,
-      servicesFound: services.length,
-    },
-    'Service selected'
-  );
+  const eligible = services.filter(s => s.reputation >= minReputation);
+  if (!eligible.length) {
+    logger.error(
+      { event: EVENT.TASK_START, category, servicesFound: services.length, minReputation },
+      'No services meet minimum reputation threshold'
+    );
+    return { success: false, priceUsdc: null };
+  }
 
-  if (scoringEnabled) {
-    const check = await checkSpend(best.price_usdc, category);
-    if (!check.allowed) {
-      logger.warn(
-        {
-          event: EVENT.SPEND_CHECK_BLOCKED,
-          category,
-          serviceId: best.id,
-          serviceName: best.name,
-          priceUsdc: best.price_usdc,
-          reason: check.reason,
-        },
-        'Payment blocked by spending policy'
-      );
-      return { success: false, priceUsdc: null };
-    }
+  // Top-N candidates by reputation; weighted random selection reduces single-point manipulation.
+  const candidates = [...eligible].sort((a, b) => b.reputation - a.reputation).slice(0, maxRetries);
+  const failed = new Set();
+
+  for (let attempt = 1; attempt <= candidates.length; attempt++) {
+    const available = candidates.filter(s => !failed.has(s.id));
+    if (!available.length) break;
+
+    const selected = selectWeighted(available);
+
     logger.info(
-      { event: EVENT.SPEND_CHECK_PASSED, category, serviceId: best.id, serviceName: best.name, priceUsdc: best.price_usdc },
-      'Spending policy check passed'
+      {
+        event: EVENT.SERVICE_SELECTED,
+        category,
+        serviceId: selected.id,
+        serviceName: selected.name,
+        priceUsdc: selected.price_usdc,
+        servicesFound: services.length,
+        attempt,
+      },
+      'Service selected'
     );
+
+    if (scoringEnabled) {
+      const check = await checkSpend(selected.price_usdc, category);
+      if (!check.allowed) {
+        logger.warn(
+          {
+            event: EVENT.SPEND_CHECK_BLOCKED,
+            category,
+            serviceId: selected.id,
+            serviceName: selected.name,
+            priceUsdc: selected.price_usdc,
+            reason: check.reason,
+          },
+          'Payment blocked by spending policy'
+        );
+        return { success: false, priceUsdc: null };
+      }
+      logger.info(
+        { event: EVENT.SPEND_CHECK_PASSED, category, serviceId: selected.id, serviceName: selected.name, priceUsdc: selected.price_usdc },
+        'Spending policy check passed'
+      );
+    }
+
+    const endpointUrl = buildUrl(selected.endpoint);
+    logger.debug(
+      { event: EVENT.TASK_START, category, serviceId: selected.id, endpointUrl },
+      'Sending x402 payment on Stellar'
+    );
+
+    const httpClient = buildHttpClient();
+    let response;
+    try {
+      response = await httpClient.fetch(endpointUrl);
+    } catch (err) {
+      logger.error(
+        { event: EVENT.PAYMENT_FAILED, category, serviceId: selected.id, serviceName: selected.name, priceUsdc: selected.price_usdc, err },
+        'x402 payment failed'
+      );
+      if (scoringEnabled) await recordOutcome(selected.price_usdc, false, selected.id);
+      failed.add(selected.id);
+      continue;
+    }
+
+    if (!response.ok) {
+      logger.error(
+        { event: EVENT.PAYMENT_FAILED, category, serviceId: selected.id, serviceName: selected.name, priceUsdc: selected.price_usdc, httpStatus: response.status },
+        'Service error after payment'
+      );
+      if (scoringEnabled) await recordOutcome(selected.price_usdc, false, selected.id);
+      // Payment settled but service returned bad data — penalise service reputation.
+      await submitReputation(selected.id, false);
+      failed.add(selected.id);
+      continue;
+    }
+
+    const txHash = response.headers.get('x-payment-transaction') ?? '(no hash)';
+    const data = await response.json();
+    const taskDurationMs = Date.now() - taskStart;
+
+    logger.info(
+      {
+        event: EVENT.PAYMENT_SUCCESS,
+        category,
+        serviceId: selected.id,
+        serviceName: selected.name,
+        priceUsdc: selected.price_usdc,
+        txHash,
+        scoreBefore: currentScore,
+        taskDurationMs,
+      },
+      'Payment completed'
+    );
+    logger.debug({ data }, 'Response data received');
+
+    if (scoringEnabled) await recordOutcome(selected.price_usdc, true, selected.id);
+    await submitReputation(selected.id, true);
+
+    return { success: true, priceUsdc: selected.price_usdc };
   }
 
-  const endpointUrl = buildUrl(best.endpoint);
-  logger.debug(
-    { event: EVENT.TASK_START, category, serviceId: best.id, endpointUrl },
-    'Sending x402 payment on Stellar'
-  );
-
-  const httpClient = buildHttpClient();
-  let response;
-  try {
-    response = await httpClient.fetch(endpointUrl);
-  } catch (err) {
-    logger.error(
-      { event: EVENT.PAYMENT_FAILED, category, serviceId: best.id, serviceName: best.name, priceUsdc: best.price_usdc, err },
-      'x402 payment failed'
-    );
-    if (scoringEnabled) await recordOutcome(best.price_usdc, false, best.id);
-    return { success: false, priceUsdc: best.price_usdc };
-  }
-
-  if (!response.ok) {
-    logger.error(
-      { event: EVENT.PAYMENT_FAILED, category, serviceId: best.id, serviceName: best.name, priceUsdc: best.price_usdc, httpStatus: response.status },
-      'Service error after payment'
-    );
-    if (scoringEnabled) await recordOutcome(best.price_usdc, false, best.id);
-    return { success: false, priceUsdc: best.price_usdc };
-  }
-
-  const txHash = response.headers.get('x-payment-transaction') ?? '(no hash)';
-  const data = await response.json();
   const taskDurationMs = Date.now() - taskStart;
-
-  logger.info(
-    {
-      event: EVENT.PAYMENT_SUCCESS,
-      category,
-      serviceId: best.id,
-      serviceName: best.name,
-      priceUsdc: best.price_usdc,
-      txHash,
-      scoreBefore: currentScore,
-      taskDurationMs,
-    },
-    'Payment completed'
+  logger.error(
+    { event: EVENT.PAYMENT_FAILED, category, servicesAttempted: failed.size, taskDurationMs },
+    'All candidate services exhausted'
   );
-  logger.debug({ data }, 'Response data received');
-
-  if (scoringEnabled) await recordOutcome(best.price_usdc, true, best.id);
-  await submitReputation(best.id, true);
-
-  return { success: true, priceUsdc: best.price_usdc };
+  return { success: false, priceUsdc: null };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
