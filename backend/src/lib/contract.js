@@ -1,5 +1,6 @@
 import pkg from '@stellar/stellar-sdk';
 const {
+  Account,
   Contract,
   Keypair,
   Transaction,
@@ -19,6 +20,29 @@ import { ContractError } from './ContractError.js';
 
 
 const TIMEOUT = 30;
+
+const rpcMetrics = {
+  getAccount: 0,
+  simulateTransaction: 0,
+  sendTransaction: 0,
+  getTransaction: 0,
+};
+
+function logRpcCall(method, latencyMs) {
+  rpcMetrics[method]++;
+  logger.debug({ method, latencyMs, totalCalls: rpcMetrics[method] }, 'RPC call completed');
+}
+
+export function getRpcMetrics() {
+  return { ...rpcMetrics };
+}
+
+export function resetRpcMetrics() {
+  rpcMetrics.getAccount = 0;
+  rpcMetrics.simulateTransaction = 0;
+  rpcMetrics.sendTransaction = 0;
+  rpcMetrics.getTransaction = 0;
+}
 
 const submitQueue = new PQueue({ concurrency: 1 });
 let currentSeqNum = null;
@@ -83,13 +107,15 @@ async function _simulateAndSubmit(operation, signer, retryCount = 0) {
   const passphrase = getNetworkPassphrase();
 
   const now = Date.now();
-  if (retryCount > 0 || currentSeqNum === null || (now - lastSeqSyncTime > 60000)) {
+  if (retryCount > 0 || currentSeqNum === null || (now - lastSeqSyncTime > 5000)) {
+    const acctStart = Date.now();
     const account = await server.getAccount(keypair.publicKey());
+    logRpcCall('getAccount', Date.now() - acctStart);
     currentSeqNum = BigInt(account.sequence);
     lastSeqSyncTime = now;
   }
 
-  const txAccount = new pkg.Account(keypair.publicKey(), currentSeqNum.toString());
+  const txAccount = new Account(keypair.publicKey(), currentSeqNum.toString());
 
   const tx = new TransactionBuilder(txAccount, {
     fee: BASE_FEE,
@@ -99,7 +125,9 @@ async function _simulateAndSubmit(operation, signer, retryCount = 0) {
     .setTimeout(TIMEOUT)
     .build();
 
+  const simStart = Date.now();
   const simResult = await server.simulateTransaction(tx);
+  logRpcCall('simulateTransaction', Date.now() - simStart);
 
   if (rpc.Api.isSimulationError(simResult)) {
     throw new ContractError(`Simulation failed: ${simResult.error}`, 'SIMULATION_FAILED');
@@ -108,7 +136,9 @@ async function _simulateAndSubmit(operation, signer, retryCount = 0) {
   const preparedTx = rpc.assembleTransaction(tx, simResult).build();
   preparedTx.sign(keypair);
 
+  const sendStart = Date.now();
   const sendResult = await server.sendTransaction(preparedTx);
+  logRpcCall('sendTransaction', Date.now() - sendStart);
   if (sendResult.status === 'ERROR') {
     let isBadSeq = false;
     if (sendResult.errorResultXdr) {
@@ -136,7 +166,9 @@ async function _simulateAndSubmit(operation, signer, retryCount = 0) {
   let getResult;
   for (let i = 0; i < 20; i++) {
     try {
+      const txStart = Date.now();
       getResult = await server.getTransaction(sendResult.hash);
+      logRpcCall('getTransaction', Date.now() - txStart);
       if (getResult.status !== 'NOT_FOUND') break;
     } catch (parseErr) {
       // Protocol-22 XDR parse errors on confirmed txs — treat as SUCCESS
@@ -174,7 +206,7 @@ async function simulateRead(operation) {
   const keypair = getServerKeypair();
   const passphrase = getNetworkPassphrase();
 
-  const account = await server.getAccount(keypair.publicKey());
+  const account = new Account(keypair.publicKey(), '0');
 
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
@@ -184,13 +216,44 @@ async function simulateRead(operation) {
     .setTimeout(TIMEOUT)
     .build();
 
+  const simStart = Date.now();
   const simResult = await server.simulateTransaction(tx);
+  logRpcCall('simulateTransaction', Date.now() - simStart);
 
   if (rpc.Api.isSimulationError(simResult)) {
     throw new ContractError(`Simulation failed: ${simResult.error}`, 'SIMULATION_FAILED');
   }
 
   return simResult.result?.retval;
+}
+
+export async function simulateReadBatch(operations) {
+  const server = getStellarServer();
+  const keypair = getServerKeypair();
+  const passphrase = getNetworkPassphrase();
+
+  const account = new Account(keypair.publicKey(), '0');
+
+  let builder = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: passphrase,
+  }).setTimeout(TIMEOUT);
+
+  for (const op of operations) {
+    builder = builder.addOperation(op);
+  }
+
+  const tx = builder.build();
+
+  const simStart = Date.now();
+  const simResult = await server.simulateTransaction(tx);
+  logRpcCall('simulateTransaction', Date.now() - simStart);
+
+  if (rpc.Api.isSimulationError(simResult)) {
+    throw new ContractError(`Batch simulation failed: ${simResult.error}`, 'SIMULATION_FAILED');
+  }
+
+  return (simResult.results ?? []).map(r => r.retval);
 }
 
 
@@ -770,7 +833,9 @@ export async function submitSignedAgentTx(signedXdr) {
 
   const tx = new Transaction(signedXdr, passphrase);
 
+  const sendStart = Date.now();
   const sendResult = await server.sendTransaction(tx);
+  logRpcCall('sendTransaction', Date.now() - sendStart);
   if (sendResult.status === 'ERROR') {
     throw new ContractError(`Transaction failed: ${JSON.stringify(sendResult.errorResult)}`, 'TRANSACTION_FAILED');
   }
@@ -778,7 +843,9 @@ export async function submitSignedAgentTx(signedXdr) {
   let getResult;
   for (let i = 0; i < 20; i++) {
     try {
+      const txStart = Date.now();
       getResult = await server.getTransaction(sendResult.hash);
+      logRpcCall('getTransaction', Date.now() - txStart);
       if (getResult.status !== 'NOT_FOUND') break;
     } catch (parseErr) {
       if (parseErr.message?.includes('Bad union switch') || parseErr.message?.includes('XDR')) {

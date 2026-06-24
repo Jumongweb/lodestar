@@ -15,9 +15,28 @@ vi.mock('../config.js', () => ({
   },
 }));
 
+const { mockSimulateTransaction } = vi.hoisted(() => ({
+  mockSimulateTransaction: vi.fn(),
+}));
+
+vi.mock('./stellar.js', () => ({
+  getStellarServer: () => ({
+    simulateTransaction: mockSimulateTransaction,
+  }),
+  getNetworkPassphrase: () => 'Test SDF Network ; September 2015',
+}));
+
+import sdkPkg from '@stellar/stellar-sdk';
 import * as contractLib from './contract.js';
 
+const { StrKey } = sdkPkg;
+const VALID_CONTRACT_ID = StrKey.encodeContract(Buffer.alloc(32));
+
 const { mapAgent, mapPolicy } = contractLib;
+
+function resetMockServer() {
+  mockSimulateTransaction.mockReset();
+}
 
 describe('registerServiceOnChain duplicate checks', () => {
   let activeServiceExistsSpy;
@@ -458,5 +477,54 @@ describe('mapPolicy', () => {
     const result = mapPolicy(raw);
 
     expect(result.allowed_categories).toEqual([]);
+  });
+});
+
+describe('simulateReadBatch', () => {
+  let contract;
+
+  beforeEach(() => {
+    resetMockServer();
+    contractLib.resetRpcMetrics();
+    contract = new sdkPkg.Contract(VALID_CONTRACT_ID);
+  });
+
+  it('returns empty array when operations is empty', async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({ results: [] });
+
+    const results = await contractLib.simulateReadBatch([]);
+
+    expect(results).toEqual([]);
+    expect(mockSimulateTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('throws ContractError on simulation error', async () => {
+    mockSimulateTransaction.mockResolvedValueOnce({ error: 'simulation exploded' });
+    const ops = [contract.call('get_service_count')];
+
+    await expect(contractLib.simulateReadBatch(ops)).rejects.toThrow('Batch simulation failed');
+  });
+});
+
+describe('rpcMetrics', () => {
+  beforeEach(() => {
+    contractLib.resetRpcMetrics();
+  });
+
+  it('getRpcMetrics returns current counts', () => {
+    const metrics = contractLib.getRpcMetrics();
+    expect(metrics).toEqual({
+      getAccount: 0,
+      simulateTransaction: 0,
+      sendTransaction: 0,
+      getTransaction: 0,
+    });
+  });
+
+  it('resetRpcMetrics clears all counters', () => {
+    contractLib.getRpcMetrics();
+    contractLib.resetRpcMetrics();
+    const metrics = contractLib.getRpcMetrics();
+    expect(metrics.simulateTransaction).toBe(0);
   });
 });
