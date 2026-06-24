@@ -34,7 +34,7 @@ const paymentConfig = {
       scheme: 'exact',
       price: `$${config.x402.weatherPrice}`,
       network: 'stellar:testnet',
-      payTo: config.server.address,
+      payTo: config.x402.payTo,
     },
     description: 'Real-time weather data via Lodestar',
   },
@@ -43,7 +43,7 @@ const paymentConfig = {
       scheme: 'exact',
       price: `$${config.x402.searchPrice}`,
       network: 'stellar:testnet',
-      payTo: config.server.address,
+      payTo: config.x402.payTo,
     },
     description: 'Web search results via Lodestar',
   },
@@ -59,6 +59,11 @@ router.get('/weather', async (req, res) => {
   try {
     const lat = parseFloat(req.query.lat) || 40.7128;
     const lon = parseFloat(req.query.lon) || -74.006;
+
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+      logger.warn({ lat, lon }, 'Invalid coordinates supplied to GET /demo/weather');
+      return res.status(400).json({ error: 'Coordinates out of range', code: 'INVALID_COORDINATES' });
+    }
 
     const url =
       `https://api.open-meteo.com/v1/forecast` +

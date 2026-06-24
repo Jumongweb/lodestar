@@ -50,6 +50,13 @@ function parseTrustProxy(value) {
   return value;
 }
 
+// Validate PAYMENT_ADDRESS format if explicitly provided (not relying on fallback)
+if (process.env.PAYMENT_ADDRESS && !/^G[A-Z2-7]{55}$/.test(process.env.PAYMENT_ADDRESS)) {
+  throw new Error(
+    `Invalid PAYMENT_ADDRESS="${process.env.PAYMENT_ADDRESS}" — must be a valid G... Stellar address`,
+  );
+}
+
 const config = Object.freeze({
   nodeEnv: process.env.NODE_ENV ?? 'development',
   port: parseInt(process.env.PORT ?? '3001', 10),
@@ -76,6 +83,7 @@ const config = Object.freeze({
     facilitatorUrl: process.env.FACILITATOR_URL,
     searchPrice: process.env.SEARCH_PRICE ?? '0.001',
     weatherPrice: process.env.WEATHER_PRICE ?? '0.001',
+    payTo: process.env.PAYMENT_ADDRESS || process.env.SERVER_STELLAR_ADDRESS,
   },
 
   braveApiKey: process.env.BRAVE_API_KEY ?? '',
@@ -89,6 +97,23 @@ const config = Object.freeze({
   // Trust proxy setting for Express — required so rate limiting reads the real
   // client IP (X-Forwarded-For) when running behind a reverse proxy (e.g. Render).
   trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
+
+  // Reputation voting is gated on-chain: a vote must be signed by a registered
+  // agent (`caller.require_auth()` + cross-contract `is_registered`). The hosted
+  // backend can therefore only cast votes for agents whose secret keys it holds.
+  // `voterSecrets` is that allowlist of demo-agent signing keys. The server key
+  // always doubles as a demo voter; additional pre-funded, on-chain-registered
+  // demo agents can be added via DEMO_VOTER_SECRETS (comma-separated). Any other
+  // agent must submit its own wallet-signed transaction.
+  demo: {
+    voterSecrets: [
+      process.env.SERVER_STELLAR_SECRET,
+      ...(process.env.DEMO_VOTER_SECRETS ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ],
+  },
 
   // Rate limiting for public write endpoints (anti-spam for on-chain writes).
   rateLimit: {

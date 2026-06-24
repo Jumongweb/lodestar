@@ -161,6 +161,16 @@ async function recordOutcome(amountUsdc, success, serviceId) {
 
 // ── x402 client ───────────────────────────────────────────────────────────────
 
+const STROOPS_PER_USDC = 10_000_000;
+
+function stroopsToUsdcStr(stroops) {
+  return String(Number(stroops) / STROOPS_PER_USDC);
+}
+
+function usdcStrToStroops(usdcStr) {
+  return BigInt(Math.round(parseFloat(usdcStr) * STROOPS_PER_USDC));
+}
+
 function buildHttpClient() {
   const signer = createEd25519Signer(AGENT_SECRET, 'stellar:testnet');
   const scheme = new ExactStellarScheme(signer, { url: RPC_URL });
@@ -169,20 +179,15 @@ function buildHttpClient() {
 
   // Implement fetch manually — x402HTTPClient.fetch() was removed in this version
   httpClient.fetch = async (url, init = {}) => {
-    // Step 1: probe the endpoint
     const probe = await fetch(url, init);
     if (probe.status !== 402) return probe;
 
-    // Step 2: decode the 402 payment-required header
     const paymentRequired = httpClient.getPaymentRequiredResponse(
       (name) => probe.headers.get(name),
       probe.status === 402 ? await probe.json().catch(() => undefined) : undefined
     );
 
-    // Step 3: build and sign the payment payload
     const paymentPayload = await httpClient.createPaymentPayload(paymentRequired);
-
-    // Step 4: encode as header and retry
     const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
     return fetch(url, {
       ...init,
@@ -203,11 +208,18 @@ async function fetchServices(category) {
 }
 
 async function submitReputation(id, positive) {
-  await fetch(`${LODESTAR_API_URL}/api/reputation/${id}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ positive }),
-  }).catch(() => {});
+  try {
+    const res = await fetch(`${LODESTAR_API_URL}/api/reputation/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ positive, agent: AGENT_ADDRESS }),
+    });
+    if (!res.ok) {
+      logger.debug({ status: res.status }, 'Reputation vote not applied (best-effort)');
+    }
+  } catch {
+    // Intentionally best-effort — a failed vote must not abort the agent run.
+  }
 }
 
 // Weighted random selection: higher reputation = proportionally more likely to be chosen.

@@ -1,11 +1,11 @@
-import { vi, describe, it, expect } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../config.js', () => ({
   default: {
     contract: { id: 'mock', agentsId: 'mock' },
-    server: { address: 'mock', secret: 'mock' },
+    server: { address: 'mock', secret: 'SDY7R6HC2UK4D4CWWBKZBJTE6FLY5QHGQCK2U6U3R3KASMW5OPWMBDO2' },
     stellar: { network: 'testnet', rpcUrl: 'https://mock', networkPassphrase: 'mock', usdcContractId: 'mock' },
-    x402: { facilitatorUrl: 'https://mock', searchPrice: '0.001', weatherPrice: '0.001' },
+    x402: { facilitatorUrl: 'https://mock', searchPrice: '0.001', weatherPrice: '0.001', payTo: 'G_MOCK_PAYMENT' },
     braveApiKey: '',
     corsOrigin: ['http://localhost:3000'],
     jsonBodyLimit: '100kb',
@@ -15,7 +15,69 @@ vi.mock('../config.js', () => ({
   },
 }));
 
-import { mapAgent, mapPolicy } from './contract.js';
+import * as contractLib from './contract.js';
+
+const { mapAgent, mapPolicy } = contractLib;
+
+describe('registerServiceOnChain duplicate checks', () => {
+  let activeServiceExistsSpy;
+
+  beforeEach(() => {
+    activeServiceExistsSpy = vi.spyOn(contractLib.contractHelpers, 'activeServiceExists');
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('returns true when an active service exists for the same provider and endpoint', async () => {
+    const provider = 'GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ';
+    const endpoint = 'https://test.example.com';
+    activeServiceExistsSpy.mockResolvedValueOnce(true);
+
+    expect(await contractLib.activeServiceExists(provider, endpoint)).toBe(true);
+    expect(activeServiceExistsSpy).toHaveBeenCalledWith(provider, endpoint, expect.any(Function));
+  });
+
+  it('returns false when no matching active service exists', async () => {
+    activeServiceExistsSpy.mockResolvedValueOnce(false);
+
+    expect(await contractLib.activeServiceExists('GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ', 'https://test.example.com')).toBe(false);
+  });
+
+  it('throws when duplicate active service exists during registration', async () => {
+    activeServiceExistsSpy.mockResolvedValueOnce(true);
+
+    await expect(
+      contractLib.registerServiceOnChain('Service', 'Description', 'https://test.example.com', '0.001', 'test')
+    ).rejects.toThrow('Active service with same provider and endpoint already exists');
+
+    expect(activeServiceExistsSpy).toHaveBeenCalled();
+  });
+});
+
+describe('activeServiceExists pagination', () => {
+  it('continues scanning when a page is shorter than the requested page size', async () => {
+    const provider = 'GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ';
+    const endpoint = 'https://test.example.com';
+
+    const fetchServices = vi
+      .fn()
+      .mockResolvedValueOnce([
+        { provider: 'GAOTHER', endpoint: 'https://other.example.com' },
+      ])
+      .mockResolvedValueOnce([
+        { provider, endpoint },
+      ]);
+
+    await expect(
+      contractLib.contractHelpers.activeServiceExists(provider, endpoint, fetchServices)
+    ).resolves.toBe(true);
+
+    expect(fetchServices).toHaveBeenNthCalledWith(1, { page: 0, pageSize: 20 });
+    expect(fetchServices).toHaveBeenNthCalledWith(2, { page: 1, pageSize: 20 });
+  });
+});
 
 describe('mapAgent', () => {
   it('should map a basic agent object', () => {
@@ -41,7 +103,7 @@ describe('mapAgent', () => {
     expect(result.address).toBe(raw.address);
     expect(result.name).toBe('Test Agent');
     expect(result.score).toBe(100);
-    expect(result.total_payments).toBe(5);
+    expect(result.total_payments).toBe('5');
     expect(result.total_volume_stroops).toBe('10000000');
     expect(result.active).toBe(true);
     expect(result.flagged).toBe(false);
@@ -68,10 +130,10 @@ describe('mapAgent', () => {
     const result = mapAgent(raw);
 
     expect(result.score).toBe(0);
-    expect(result.total_payments).toBe(0);
+    expect(result.total_payments).toBe('0');
     expect(result.total_volume_stroops).toBe('0');
-    expect(result.registered_at).toBe(0);
-    expect(result.last_active).toBe(0);
+    expect(result.registered_at).toBe('0');
+    expect(result.last_active).toBe('0');
   });
 
   it('should handle values at Number.MAX_SAFE_INTEGER', () => {
@@ -96,10 +158,10 @@ describe('mapAgent', () => {
     const result = mapAgent(raw);
 
     expect(result.score).toBe(Number.MAX_SAFE_INTEGER);
-    expect(result.total_payments).toBe(Number.MAX_SAFE_INTEGER);
+    expect(result.total_payments).toBe(String(Number.MAX_SAFE_INTEGER));
     expect(result.total_volume_stroops).toBe(String(Number.MAX_SAFE_INTEGER));
-    expect(result.registered_at).toBe(Number.MAX_SAFE_INTEGER);
-    expect(result.last_active).toBe(Number.MAX_SAFE_INTEGER);
+    expect(result.registered_at).toBe(String(Number.MAX_SAFE_INTEGER));
+    expect(result.last_active).toBe(String(Number.MAX_SAFE_INTEGER));
   });
 
   it('should handle values exceeding Number.MAX_SAFE_INTEGER', () => {
@@ -153,7 +215,7 @@ describe('mapAgent', () => {
     const result = mapAgent(raw);
 
     expect(result.score).toBe(-50);
-    expect(result.total_payments).toBe(10);
+    expect(result.total_payments).toBe('10');
   });
 
   it('should handle values at Number.MIN_SAFE_INTEGER', () => {
@@ -249,7 +311,7 @@ describe('mapPolicy', () => {
     expect(result.allowed_categories).toEqual(['weather', 'search']);
     expect(result.min_score_to_earn).toBe(300);
     expect(result.daily_spent_stroops).toBe('0');
-    expect(result.last_reset_ledger).toBe(12345);
+    expect(result.last_reset_ledger).toBe('12345');
   });
 
   it('should handle zero values', () => {
@@ -270,7 +332,7 @@ describe('mapPolicy', () => {
     expect(result.allowed_categories).toEqual([]);
     expect(result.min_score_to_earn).toBe(0);
     expect(result.daily_spent_stroops).toBe('0');
-    expect(result.last_reset_ledger).toBe(0);
+    expect(result.last_reset_ledger).toBe('0');
   });
 
   it('should handle values at Number.MAX_SAFE_INTEGER', () => {
@@ -291,7 +353,7 @@ describe('mapPolicy', () => {
     expect(result.max_per_day_stroops).toBe(String(Number.MAX_SAFE_INTEGER));
     expect(result.min_score_to_earn).toBe(Number.MAX_SAFE_INTEGER);
     expect(result.daily_spent_stroops).toBe(String(Number.MAX_SAFE_INTEGER));
-    expect(result.last_reset_ledger).toBe(Number.MAX_SAFE_INTEGER);
+    expect(result.last_reset_ledger).toBe(String(Number.MAX_SAFE_INTEGER));
   });
 
   it('should handle values exceeding Number.MAX_SAFE_INTEGER', () => {
