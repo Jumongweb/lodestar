@@ -106,7 +106,7 @@ export const CATEGORY_FILTERS: { label: string; value: Category | 'all' }[] = [
 ];
 
 export function getCategoryMeta(category: Category | string | undefined): CategoryMeta {
-  if (category && category in CATEGORY_META) {
+  if (category && Object.hasOwn(CATEGORY_META, category)) {
     return CATEGORY_META[category as Category];
   }
 

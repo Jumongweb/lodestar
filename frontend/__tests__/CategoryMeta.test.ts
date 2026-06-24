@@ -40,5 +40,9 @@ describe('category metadata', () => {
       label: 'Unknown',
       badgeClass: 'bg-gray-50 text-gray-700',
     });
+    expect(getCategoryMeta('constructor')).toMatchObject({
+      label: 'Unknown',
+      badgeClass: 'bg-gray-50 text-gray-700',
+    });
   });
 });
