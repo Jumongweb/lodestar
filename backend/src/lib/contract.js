@@ -7,11 +7,13 @@ const {
   BASE_FEE,
   xdr,
   Address,
+  StrKey,
   nativeToScVal,
   scValToNative,
   rpc,
 } = pkg;
 import PQueue from 'p-queue';
+import { randomUUID } from 'node:crypto';
 import config from '../config.js';
 import { getStellarServer, getNetworkPassphrase } from './stellar.js';
 import logger from './logger.js';
@@ -19,10 +21,12 @@ import { ContractError } from './ContractError.js';
 
 
 const TIMEOUT = 30;
+const REGISTRY_SUBMIT_TOKEN_TTL_MS = 10 * 60 * 1000;
 
 const submitQueue = new PQueue({ concurrency: 1 });
 let currentSeqNum = null;
 let lastSeqSyncTime = 0;
+const preparedRegistrySubmissions = new Map();
 
 export function getSubmitQueueDepth() {
   return submitQueue.size + submitQueue.pending;
@@ -169,6 +173,46 @@ function simulateAndSubmit(operation, signer) {
   return submitQueue.add(() => _simulateAndSubmit(operation, signer, 0));
 }
 
+function prunePreparedRegistrySubmissions(now = Date.now()) {
+  for (const [token, entry] of preparedRegistrySubmissions.entries()) {
+    if (entry.expiresAt <= now) {
+      preparedRegistrySubmissions.delete(token);
+    }
+  }
+}
+
+function createPreparedRegistrySubmission(action, xdrBase64) {
+  prunePreparedRegistrySubmissions();
+  const submitToken = randomUUID();
+  preparedRegistrySubmissions.set(submitToken, {
+    action,
+    expiresAt: Date.now() + REGISTRY_SUBMIT_TOKEN_TTL_MS,
+  });
+  return { xdr: xdrBase64, submitToken };
+}
+
+async function buildUnsignedTx(operation) {
+  const server = getStellarServer();
+  const keypair = getServerKeypair();
+  const passphrase = getNetworkPassphrase();
+
+  const account = await server.getAccount(keypair.publicKey());
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: passphrase,
+  })
+    .addOperation(operation)
+    .setTimeout(TIMEOUT)
+    .build();
+
+  const simResult = await server.simulateTransaction(tx);
+  if (rpc.Api.isSimulationError(simResult)) {
+    throw new ContractError(`Simulation failed: ${simResult.error}`, 'SIMULATION_FAILED');
+  }
+
+  return rpc.assembleTransaction(tx, simResult).build().toXDR();
+}
+
 async function simulateRead(operation) {
   const server = getStellarServer();
   const keypair = getServerKeypair();
@@ -296,9 +340,25 @@ export async function activeServiceExists(provider, endpoint, fetchServices = li
   return contractHelpers.activeServiceExists(provider, endpoint, fetchServices);
 }
 
+export async function listServicesByProvider(provider, fetchServices = listServices) {
+  let page = 0;
+  const pageSize = 20;
+  const matches = [];
+
+  while (true) {
+    const services = await fetchServices({ page, pageSize });
+    if (!services.length) {
+      return matches;
+    }
+
+    matches.push(...services.filter((service) => service.provider === provider));
+    page += 1;
+  }
+}
+
 /**
  * Register a service on-chain.
- * Rejects duplicate active service entries for the same provider and endpoint.
+ * Only available to seed/ops scripts that explicitly opt into SEEDING_MODE.
  */
 export async function registerServiceOnChain(
   name,
@@ -309,6 +369,13 @@ export async function registerServiceOnChain(
   payTo
 ) {
   try {
+    if (process.env.SEEDING_MODE !== 'true') {
+      throw new ContractError(
+        'Server-signed service registration is disabled. Set SEEDING_MODE=true for seed scripts or use the wallet-signed registry flow.',
+        'SEEDING_MODE_REQUIRED'
+      );
+    }
+
     const keypair = getServerKeypair();
     const providerAddress = Address.fromString(keypair.publicKey());
     const provider = providerAddress.toString();
@@ -342,6 +409,89 @@ export async function registerServiceOnChain(
     logger.error({ err, name }, 'registerServiceOnChain failed');
     throw err;
   }
+}
+
+export async function buildUnsignedRegistryTx(action, providerAddress, params = {}) {
+  const contract = getContract();
+  const provider = Address.fromString(providerAddress);
+
+  if (action === 'register') {
+    if (await contractHelpers.activeServiceExists(providerAddress, params.endpoint)) {
+      logger.warn({ provider: providerAddress, endpoint: params.endpoint }, 'Duplicate active service registration blocked');
+      throw new ContractError(
+        'Active service with same provider and endpoint already exists',
+        'DUPLICATE_SERVICE'
+      );
+    }
+
+    const op = contract.call(
+      'register_service',
+      nativeToScVal(provider, { type: 'address' }),
+      nativeToScVal(params.name, { type: 'string' }),
+      nativeToScVal(params.description, { type: 'string' }),
+      nativeToScVal(params.endpoint, { type: 'string' }),
+      nativeToScVal(String(params.priceUsdc), { type: 'string' }),
+      nativeToScVal(params.payTo || config.x402.payTo, { type: 'string' }),
+      nativeToScVal(params.category, { type: 'string' })
+    );
+
+    const xdr = await buildUnsignedTx(op);
+    return createPreparedRegistrySubmission(action, xdr);
+  }
+
+  if (action === 'deactivate') {
+    const op = contract.call(
+      'deactivate_service',
+      nativeToScVal(provider, { type: 'address' }),
+      nativeToScVal(BigInt(params.id), { type: 'u64' })
+    );
+
+    const xdr = await buildUnsignedTx(op);
+    return createPreparedRegistrySubmission(action, xdr);
+  }
+
+  throw new Error(`Unknown registry action: ${action}`);
+}
+
+export function validatePreparedRegistrySubmission(submitToken, signedXdr) {
+  prunePreparedRegistrySubmissions();
+
+  if (!submitToken || typeof submitToken !== 'string') {
+    throw new ContractError('`submitToken` is required', 'INVALID_BODY');
+  }
+
+  const prepared = preparedRegistrySubmissions.get(submitToken);
+  if (!prepared) {
+    throw new ContractError('Registry submission token is missing or expired', 'INVALID_SUBMIT_TOKEN');
+  }
+
+  let tx;
+  try {
+    tx = new Transaction(signedXdr, getNetworkPassphrase());
+  } catch {
+    throw new ContractError('`signedXdr` must be a valid transaction XDR', 'INVALID_BODY');
+  }
+
+  const [operation] = tx.operations;
+  const expectedFunctionName = prepared.action === 'register'
+    ? 'register_service'
+    : 'deactivate_service';
+
+  const isRegistryInvocation = Boolean(
+    operation &&
+    tx.operations.length === 1 &&
+    operation.type === 'invokeHostFunction' &&
+    operation.func.switch().name === 'hostFunctionTypeInvokeContract' &&
+    StrKey.encodeContract(operation.func.invokeContract().contractAddress().contractId()) === config.contract.id &&
+    operation.func.invokeContract().functionName().toString() === expectedFunctionName
+  );
+
+  if (!isRegistryInvocation) {
+    throw new ContractError('signedXdr does not match the prepared registry transaction', 'SUBMISSION_MISMATCH');
+  }
+
+  preparedRegistrySubmissions.delete(submitToken);
+  return prepared;
 }
 
 /**
@@ -706,9 +856,6 @@ export async function updatePolicyOnChain(
  * @returns {Promise<string>}    - base64-encoded transaction XDR ready for signing
  */
 export async function buildUnsignedAgentTx(action, agentAddress, params = {}) {
-  const server = getStellarServer();
-  const keypair = getServerKeypair();
-  const passphrase = getNetworkPassphrase();
   const contract = getAgentsContract();
   const callerAddr = Address.fromString(agentAddress);
 
@@ -740,35 +887,16 @@ export async function buildUnsignedAgentTx(action, agentAddress, params = {}) {
     throw new Error(`Unknown action: ${action}`);
   }
 
-  // Use server account as fee payer; the agent wallet will add its auth entry
-  const account = await server.getAccount(keypair.publicKey());
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: passphrase,
-  })
-    .addOperation(op)
-    .setTimeout(TIMEOUT)
-    .build();
-
-  const simResult = await server.simulateTransaction(tx);
-  if (rpc.Api.isSimulationError(simResult)) {
-    throw new ContractError(`Simulation failed: ${simResult.error}`, 'SIMULATION_FAILED');
-  }
-
-  const preparedTx = rpc.assembleTransaction(tx, simResult).build();
-  return preparedTx.toXDR();
+  return buildUnsignedTx(op);
 }
 
-/**
- * Submit a pre-signed transaction XDR (signed by the agent's Freighter wallet).
- * @param {string} signedXdr - base64-encoded signed transaction XDR
- * @returns {Promise<string>} - transaction hash
- */
-export async function submitSignedAgentTx(signedXdr) {
+async function submitSignedTx(signedXdr) {
   const server = getStellarServer();
   const passphrase = getNetworkPassphrase();
+  const keypair = getServerKeypair();
 
   const tx = new Transaction(signedXdr, passphrase);
+  tx.sign(keypair);
 
   const sendResult = await server.sendTransaction(tx);
   if (sendResult.status === 'ERROR') {
@@ -782,7 +910,7 @@ export async function submitSignedAgentTx(signedXdr) {
       if (getResult.status !== 'NOT_FOUND') break;
     } catch (parseErr) {
       if (parseErr.message?.includes('Bad union switch') || parseErr.message?.includes('XDR')) {
-        return sendResult.hash;
+        return { hash: sendResult.hash, returnValue: null };
       }
       throw parseErr;
     }
@@ -796,5 +924,26 @@ export async function submitSignedAgentTx(signedXdr) {
     throw new ContractError(`Transaction failed on-chain: ${sendResult.hash}`, 'ON_CHAIN_FAILURE');
   }
 
-  return sendResult.hash;
+  return {
+    hash: sendResult.hash,
+    returnValue: getResult.returnValue ?? null,
+  };
+}
+
+/**
+ * Submit a pre-signed transaction XDR (signed by the agent's Freighter wallet).
+ * @param {string} signedXdr - base64-encoded signed transaction XDR
+ * @returns {Promise<string>} - transaction hash
+ */
+export async function submitSignedAgentTx(signedXdr) {
+  const { hash } = await submitSignedTx(signedXdr);
+  return hash;
+}
+
+export async function submitSignedRegistryTx(signedXdr) {
+  const { hash, returnValue } = await submitSignedTx(signedXdr);
+  return {
+    hash,
+    id: returnValue ? Number(scValToNative(returnValue)) : null,
+  };
 }
