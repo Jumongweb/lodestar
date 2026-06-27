@@ -17,8 +17,9 @@ const ORIGINAL_ENV = { ...process.env };
 async function loadConfig(overrides = {}) {
   vi.resetModules();
   process.env = { ...ORIGINAL_ENV, ...REQUIRED, ...overrides };
-  // Strip any rate-limit/proxy vars not explicitly provided so defaults apply.
+  // Strip optional vars not explicitly provided so defaults apply.
   for (const key of [
+    'AGENTS_CONTRACT_ID',
     'RATE_LIMIT_WINDOW_MS',
     'RATE_LIMIT_MAX',
     'PAYMENT_RATE_LIMIT_WINDOW_MS',
