@@ -488,44 +488,62 @@ export async function registerServiceOnChain(
 
 /**
  * Deactivate a service on-chain.
- * The caller must be the service's provider — the contract enforces
- * `provider.require_auth()` and `provider == entry.provider`.
+ *
+ * Validates service existence, provider ownership, and active status, then
+ * builds an unsigned transaction XDR for the provider to sign with their
+ * wallet (e.g. Freighter). The contract enforces `provider.require_auth()`
+ * so the transaction must be authorized by the provider's key, not the
+ * server key.
  *
  * @param {number} id - The numeric service ID to deactivate
  * @param {string} providerAddress - Stellar address of the provider who owns the service
- * @returns {Promise<boolean>} true on success
- * @throws {ContractError} if the service is not found or provider doesn't match
+ * @returns {Promise<{xdr: string, submitToken: string}>} prepared tx for wallet signing
+ * @throws {ContractError} if the service is not found, provider doesn't match, or already inactive
  */
 export async function deactivateServiceOnChain(id, providerAddress) {
   try {
-    const service = await getService(id);
-    if (!service) {
+    // Read the service directly from chain to distinguish "not found" from
+    // backend/RPC failures — getService() swallows errors and returns null.
+    const contract = getContract();
+    const readOp = contract.call('get_service', nativeToScVal(BigInt(id), { type: 'u64' }));
+    let retval;
+    try {
+      retval = await simulateRead(readOp);
+    } catch (readErr) {
+      // simulateRead threw — this is an RPC/simulation failure, not "not found"
+      logger.error({ err: readErr, id }, 'deactivateServiceOnChain: failed to read service from chain');
+      throw new ContractError(
+        `Failed to read service ${id}: ${readErr.message ?? 'RPC error'}`,
+        'SERVICE_READ_FAILED'
+      );
+    }
+
+    if (!retval) {
       throw new ContractError(`Service ${id} not found`, 'SERVICE_NOT_FOUND');
     }
-    if (service.provider !== providerAddress) {
+
+    const native = scValToNative(retval);
+    const serviceProvider = native.provider?.toString() ?? native.provider;
+
+    if (serviceProvider !== providerAddress) {
       throw new ContractError(
         'Only the provider that registered this service can deactivate it',
         'PROVIDER_MISMATCH'
       );
     }
-    if (!service.active) {
+    if (!native.active) {
       throw new ContractError(`Service ${id} is already deactivated`, 'ALREADY_INACTIVE');
     }
 
-    const contract = getContract();
-    const provider = Address.fromString(providerAddress);
-
-    const op = contract.call(
-      'deactivate_service',
-      nativeToScVal(provider, { type: 'address' }),
-      nativeToScVal(BigInt(id), { type: 'u64' })
-    );
-
-    await simulateAndSubmit(op);
-    logger.info({ id, providerAddress }, 'Service deactivated on-chain');
-    return true;
+    // Build unsigned tx — the provider must sign with their wallet to satisfy
+    // the on-chain `provider.require_auth()` check.
+    const prepared = await buildUnsignedRegistryTx('deactivate', providerAddress, { id });
+    logger.info({ id, providerAddress }, 'Built unsigned deactivation tx for provider signing');
+    return prepared;
   } catch (err) {
-    logger.error({ err, id, providerAddress }, 'deactivateServiceOnChain failed');
+    if (!(err instanceof ContractError)) {
+      logger.error({ err, id, providerAddress }, 'deactivateServiceOnChain failed');
+    }
     throw err;
   }
 }

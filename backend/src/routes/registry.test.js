@@ -613,32 +613,42 @@ describe('POST /api/services/:id/deactivate', () => {
   const VALID_PROVIDER = VALID_STELLAR_ADDRESS;
 
   beforeEach(() => {
-    mockGetService.mockReset();
     mockDeactivateServiceOnChain.mockReset();
   });
 
-  it('deactivates a service when provider matches', async () => {
-    mockGetService.mockResolvedValueOnce(makeService({ id: 7, provider: VALID_PROVIDER, active: true }));
-    mockDeactivateServiceOnChain.mockResolvedValueOnce(true);
+  it('returns unsigned XDR for a valid deactivation request', async () => {
+    mockDeactivateServiceOnChain.mockResolvedValueOnce({
+      xdr: 'AAAA_DEACTIVATE_XDR',
+      submitToken: 'submit-token-deact',
+    });
 
     const res = await request(app)
       .post('/api/services/7/deactivate')
       .send({ providerAddress: VALID_PROVIDER });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ success: true, id: 7, active: false });
-    expect(mockGetService).toHaveBeenCalledWith(7);
+    expect(res.body).toEqual({ xdr: 'AAAA_DEACTIVATE_XDR', submitToken: 'submit-token-deact' });
     expect(mockDeactivateServiceOnChain).toHaveBeenCalledWith(7, VALID_PROVIDER);
   });
 
-  it('returns 400 for invalid service ID', async () => {
+  it('returns 400 for non-numeric service ID', async () => {
     const res = await request(app)
       .post('/api/services/abc/deactivate')
       .send({ providerAddress: VALID_PROVIDER });
 
     expect(res.status).toBe(400);
     expect(res.body.code).toBe('INVALID_ID');
-    expect(mockGetService).not.toHaveBeenCalled();
+    expect(mockDeactivateServiceOnChain).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 for partially numeric service ID', async () => {
+    const res = await request(app)
+      .post('/api/services/7abc/deactivate')
+      .send({ providerAddress: VALID_PROVIDER });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('INVALID_ID');
+    expect(mockDeactivateServiceOnChain).not.toHaveBeenCalled();
   });
 
   it('returns 400 for invalid provider address', async () => {
@@ -648,24 +658,42 @@ describe('POST /api/services/:id/deactivate', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.code).toBe('INVALID_BODY');
-    expect(mockGetService).not.toHaveBeenCalled();
+    expect(mockDeactivateServiceOnChain).not.toHaveBeenCalled();
   });
 
   it('returns 404 when service is not found', async () => {
-    mockGetService.mockResolvedValueOnce(null);
+    const { ContractError } = await import('../lib/ContractError.js');
+    mockDeactivateServiceOnChain.mockRejectedValueOnce(
+      new ContractError('Service 999 not found', 'SERVICE_NOT_FOUND'),
+    );
 
     const res = await request(app)
       .post('/api/services/999/deactivate')
       .send({ providerAddress: VALID_PROVIDER });
 
     expect(res.status).toBe(404);
-    expect(res.body.code).toBe('NOT_FOUND');
-    expect(mockDeactivateServiceOnChain).not.toHaveBeenCalled();
+    expect(res.body.code).toBe('SERVICE_NOT_FOUND');
+  });
+
+  it('returns 502 when chain read fails', async () => {
+    const { ContractError } = await import('../lib/ContractError.js');
+    mockDeactivateServiceOnChain.mockRejectedValueOnce(
+      new ContractError('Failed to read service 1: RPC timeout', 'SERVICE_READ_FAILED'),
+    );
+
+    const res = await request(app)
+      .post('/api/services/1/deactivate')
+      .send({ providerAddress: VALID_PROVIDER });
+
+    expect(res.status).toBe(502);
+    expect(res.body.code).toBe('SERVICE_READ_FAILED');
   });
 
   it('returns 403 when provider does not match', async () => {
-    const OTHER_PROVIDER = 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
-    mockGetService.mockResolvedValueOnce(makeService({ id: 7, provider: OTHER_PROVIDER }));
+    const { ContractError } = await import('../lib/ContractError.js');
+    mockDeactivateServiceOnChain.mockRejectedValueOnce(
+      new ContractError('Only the provider that registered this service can deactivate it', 'PROVIDER_MISMATCH'),
+    );
 
     const res = await request(app)
       .post('/api/services/7/deactivate')
@@ -673,11 +701,13 @@ describe('POST /api/services/:id/deactivate', () => {
 
     expect(res.status).toBe(403);
     expect(res.body.code).toBe('PROVIDER_MISMATCH');
-    expect(mockDeactivateServiceOnChain).not.toHaveBeenCalled();
   });
 
   it('returns 409 when service is already inactive', async () => {
-    mockGetService.mockResolvedValueOnce(makeService({ id: 7, provider: VALID_PROVIDER, active: false }));
+    const { ContractError } = await import('../lib/ContractError.js');
+    mockDeactivateServiceOnChain.mockRejectedValueOnce(
+      new ContractError('Service 7 is already deactivated', 'ALREADY_INACTIVE'),
+    );
 
     const res = await request(app)
       .post('/api/services/7/deactivate')
@@ -685,12 +715,10 @@ describe('POST /api/services/:id/deactivate', () => {
 
     expect(res.status).toBe(409);
     expect(res.body.code).toBe('ALREADY_INACTIVE');
-    expect(mockDeactivateServiceOnChain).not.toHaveBeenCalled();
   });
 
   it('returns 400 when on-chain deactivation fails with ContractError', async () => {
     const { ContractError } = await import('../lib/ContractError.js');
-    mockGetService.mockResolvedValueOnce(makeService({ id: 7, provider: VALID_PROVIDER, active: true }));
     mockDeactivateServiceOnChain.mockRejectedValueOnce(
       new ContractError('Simulation failed: auth error', 'SIMULATION_FAILED'),
     );
@@ -705,7 +733,6 @@ describe('POST /api/services/:id/deactivate', () => {
 
   it('returns 504 when transaction times out', async () => {
     const { ContractError } = await import('../lib/ContractError.js');
-    mockGetService.mockResolvedValueOnce(makeService({ id: 7, provider: VALID_PROVIDER, active: true }));
     mockDeactivateServiceOnChain.mockRejectedValueOnce(
       new ContractError('Transaction timeout', 'TRANSACTION_TIMEOUT'),
     );
@@ -719,7 +746,6 @@ describe('POST /api/services/:id/deactivate', () => {
   });
 
   it('returns 500 on unexpected error', async () => {
-    mockGetService.mockResolvedValueOnce(makeService({ id: 7, provider: VALID_PROVIDER, active: true }));
     mockDeactivateServiceOnChain.mockRejectedValueOnce(new Error('boom'));
 
     const res = await request(app)

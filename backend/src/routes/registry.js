@@ -116,22 +116,23 @@ router.get("/services/:id", async (req, res) => {
 /**
  * POST /api/services/:id/deactivate
  * Provider-authenticated deactivation. The caller must supply a valid
- * `providerAddress` that matches the service's registered provider. The
- * on-chain contract enforces `provider.require_auth()` so the signed
- * transaction must come from the provider's keypair.
+ * `providerAddress` that matches the service's registered provider.
+ * The on-chain contract enforces `provider.require_auth()` so the returned
+ * unsigned transaction must be signed by the provider's wallet (e.g.
+ * Freighter) and submitted through POST /api/registry/submit-signed-tx.
  *
  * Body: { providerAddress: string }
+ * Returns: { xdr, submitToken } — unsigned tx ready for wallet signing
  */
 router.post("/services/:id/deactivate", writeRateLimiter(), async (req, res) => {
-  let id;
-  try {
-    id = parseInt(req.params.id, 10);
-    if (isNaN(id) || id < 1) {
-      return res
-        .status(400)
-        .json({ error: "Invalid service ID", code: "INVALID_ID" });
-    }
+  const parsedId = parsePositiveSafeInteger(req.params.id);
+  if (parsedId == null) {
+    return res
+      .status(400)
+      .json({ error: "Invalid service ID", code: "INVALID_ID" });
+  }
 
+  try {
     const { providerAddress } = req.body ?? {};
     if (!isValidStellarAddress(providerAddress)) {
       return res.status(400).json({
@@ -140,34 +141,16 @@ router.post("/services/:id/deactivate", writeRateLimiter(), async (req, res) => 
       });
     }
 
-    const service = await getService(id);
-    if (!service) {
-      return res
-        .status(404)
-        .json({ error: "Service not found", code: "NOT_FOUND" });
-    }
-
-    if (service.provider !== providerAddress) {
-      return res.status(403).json({
-        error: "Only the provider that registered this service can deactivate it",
-        code: "PROVIDER_MISMATCH",
-      });
-    }
-
-    if (!service.active) {
-      return res.status(409).json({
-        error: "Service is already deactivated",
-        code: "ALREADY_INACTIVE",
-      });
-    }
-
-    await deactivateServiceOnChain(id, providerAddress);
-    logger.info({ id, providerAddress }, "Service deactivated via API");
-    res.json({ success: true, id, active: false });
+    const prepared = await deactivateServiceOnChain(parsedId, providerAddress);
+    logger.info({ id: parsedId, providerAddress }, "Built unsigned deactivation tx");
+    res.json(prepared);
   } catch (err) {
     if (err instanceof ContractError) {
       if (err.code === "SERVICE_NOT_FOUND") {
         return res.status(404).json({ error: err.message, code: err.code });
+      }
+      if (err.code === "SERVICE_READ_FAILED") {
+        return res.status(502).json({ error: err.message, code: err.code });
       }
       if (err.code === "PROVIDER_MISMATCH") {
         return res.status(403).json({ error: err.message, code: err.code });
@@ -180,7 +163,7 @@ router.post("/services/:id/deactivate", writeRateLimiter(), async (req, res) => 
       }
       return res.status(400).json({ error: err.message, code: err.code });
     }
-    logger.error({ err, id }, "POST /api/services/:id/deactivate failed");
+    logger.error({ err, id: parsedId }, "POST /api/services/:id/deactivate failed");
     res.status(500).json({
       error: "Failed to deactivate service",
       code: "DEACTIVATE_ERROR",
