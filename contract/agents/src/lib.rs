@@ -24,6 +24,7 @@ pub enum DataKey {
     IsDemo(Address),
     Policy(Address),
     RegistryContract,
+    Admin,
 }
 
 // ServiceEntry shape (mirrors the registry contract) for cross-contract calls
@@ -152,6 +153,15 @@ pub struct SpendingPolicy {
     pub last_reset_ledger: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoringConfig {
+    pub initial_score: i32,
+    pub score_success: i32,
+    pub score_failure: i32,
+    pub flag_penalty: i32,
+}
+
 // ── Contract ─────────────────────────────────────────────────────────────────
 #[contract]
 pub struct LodestarAgents;
@@ -169,6 +179,14 @@ impl LodestarAgents {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::RegistryContract, MAX_TTL, MAX_TTL);
+    }
+
+    /// Deploy-time setup: store the admin address for privileged operations.
+    pub fn __constructor(env: Env, admin: Address) {
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, MAX_TTL, MAX_TTL);
     }
 
     // Register a new agent.
@@ -431,9 +449,19 @@ impl LodestarAgents {
             .extend_ttl(&policy_key, MAX_TTL, MAX_TTL);
     }
 
-    // Flag an agent (admin: owner auth required on agent)
+    // Flag an agent (admin-only)
     pub fn flag_agent(env: Env, agent_address: Address, reason: String, caller: Address) {
         caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not set — call initialize() first");
+
+        if caller != admin {
+            panic!("unauthorized");
+        }
 
         let key = DataKey::Agent(agent_address);
         let mut agent: AgentEntryStore = env
@@ -441,11 +469,6 @@ impl LodestarAgents {
             .persistent()
             .get(&key)
             .expect("agent not found");
-
-        // Only owner can flag their own agent
-        if agent.owner != caller {
-            panic!("unauthorized");
-        }
 
         agent.flagged = true;
         agent.flag_reason = reason;
@@ -457,7 +480,7 @@ impl LodestarAgents {
             .extend_ttl(&key, MAX_TTL, MAX_TTL);
     }
 
-    // Deactivate agent
+    // Deactivate agent (owner only)
     pub fn deactivate_agent(env: Env, agent_address: Address, caller: Address) {
         caller.require_auth();
 
@@ -477,6 +500,64 @@ impl LodestarAgents {
         env.storage()
             .persistent()
             .extend_ttl(&key, MAX_TTL, MAX_TTL);
+    }
+
+    // Admin deactivate agent (can deactivate any agent regardless of ownership)
+    pub fn admin_deactivate_agent(env: Env, agent_address: Address, caller: Address) {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not set — call initialize() first");
+
+        if caller != admin {
+            panic!("unauthorized");
+        }
+
+        let key = DataKey::Agent(agent_address);
+        let mut agent: AgentEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("agent not found");
+
+        agent.active = false;
+        env.storage().persistent().set(&key, &agent);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MAX_TTL, MAX_TTL);
+    }
+
+    // Get the current admin address
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not set — call initialize() first")
+    }
+
+    // Transfer admin role to a new address (caller must be current admin)
+    pub fn transfer_admin(env: Env, new_admin: Address, caller: Address) {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("admin not set — call initialize() first");
+
+        if caller != admin {
+            panic!("unauthorized");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, MAX_TTL, MAX_TTL);
     }
 
     // List agents (paginated by limit)
@@ -591,5 +672,244 @@ impl LodestarAgents {
         env.storage()
             .persistent()
             .extend_ttl(&policy_key, MAX_TTL, MAX_TTL);
+    }
+
+    // Get the current scoring configuration constants
+    pub fn get_scoring_config(env: Env) -> ScoringConfig {
+        ScoringConfig {
+            initial_score: INITIAL_SCORE,
+            score_success: SCORE_SUCCESS,
+            score_failure: SCORE_FAILURE,
+            flag_penalty: FLAG_PENALTY,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup_agent(env: &Env, contract_id: &Address, agent_addr: &Address, owner: &Address) {
+        let client = LodestarAgentsClient::new(env, contract_id);
+        client.register_agent(
+            agent_addr,
+            &String::from_str(env, "Test Agent"),
+            &String::from_str(env, "A test agent description"),
+            owner,
+        );
+    }
+
+    #[test]
+    fn test_constructor_sets_admin() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, LodestarAgents);
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        // __constructor is called during register_contract if we pass arguments
+        // but here we just test that we can set it via constructor if we registered it properly.
+        // In Soroban tests, we usually pass args to register_contract.
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn test_get_admin_panics_when_not_set() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LodestarAgents);
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        assert!(client.try_get_admin().is_err());
+    }
+
+    #[test]
+    fn test_flag_agent_owner_cannot_flag() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        assert!(client
+            .try_flag_agent(
+                &agent_addr,
+                &String::from_str(&env, "bad behavior"),
+                &owner,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_flag_agent_succeeds_with_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        client.flag_agent(
+            &agent_addr,
+            &String::from_str(&env, "violation of terms"),
+            &admin,
+        );
+
+        let agent = client.get_agent(&agent_addr).unwrap();
+        assert!(agent.flagged);
+        assert_eq!(
+            agent.flag_reason,
+            String::from_str(&env, "violation of terms")
+        );
+        assert!(agent.score < INITIAL_SCORE);
+    }
+
+    #[test]
+    fn test_admin_deactivate_agent_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        client.admin_deactivate_agent(&agent_addr, &admin);
+
+        let agent = client.get_agent(&agent_addr).unwrap();
+        assert!(!agent.active);
+    }
+
+    #[test]
+    fn test_admin_deactivate_agent_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        let non_admin = Address::generate(&env);
+        assert!(client
+            .try_admin_deactivate_agent(&agent_addr, &non_admin)
+            .is_err());
+    }
+
+    #[test]
+    fn test_deactivate_agent_still_works_for_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        client.deactivate_agent(&agent_addr, &owner);
+
+        let agent = client.get_agent(&agent_addr).unwrap();
+        assert!(!agent.active);
+    }
+
+    #[test]
+    fn test_transfer_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&new_admin, &admin);
+
+        assert_eq!(client.get_admin(), new_admin);
+    }
+
+    #[test]
+    fn test_transfer_admin_requires_current_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let new_admin = Address::generate(&env);
+        let impostor = Address::generate(&env);
+
+        assert!(client.try_transfer_admin(&new_admin, &impostor).is_err());
+    }
+
+    #[test]
+    fn test_flag_agent_fails_when_admin_not_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, LodestarAgents);
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        let caller = Address::generate(&env);
+        assert!(client
+            .try_flag_agent(
+                &agent_addr,
+                &String::from_str(&env, "reason"),
+                &caller,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_flag_agent_requires_auth() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(LodestarAgents, (admin.clone(),));
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let agent_addr = Address::generate(&env);
+        let owner = Address::generate(&env);
+        // mock_all_auths during setup so register_agent succeeds
+        env.mock_all_auths();
+        setup_agent(&env, &contract_id, &agent_addr, &owner);
+
+        // Clear auths so require_auth in flag_agent fails
+        env.set_auths(&[]);
+        assert!(client
+            .try_flag_agent(
+                &agent_addr,
+                &String::from_str(&env, "reason"),
+                &admin,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_get_scoring_config() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LodestarAgents);
+        let client = LodestarAgentsClient::new(&env, &contract_id);
+
+        let config = client.get_scoring_config();
+        assert_eq!(config.initial_score, INITIAL_SCORE);
+        assert_eq!(config.score_success, SCORE_SUCCESS);
+        assert_eq!(config.score_failure, SCORE_FAILURE);
+        assert_eq!(config.flag_penalty, FLAG_PENALTY);
     }
 }

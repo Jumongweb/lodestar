@@ -20,8 +20,6 @@ const RPC_URL              = process.env.STELLAR_RPC_URL;
 const LODESTAR_API_URL     = process.env.LODESTAR_API_URL;
 const LODESTAR_HMAC_SECRET = process.env.LODESTAR_HMAC_SECRET ?? '';
 
-
-const agentKeypair = Keypair.fromSecret(AGENT_SECRET);
 const AGENT_ADDRESS = agentKeypair.publicKey();
 
 const logger = pino({
@@ -155,13 +153,12 @@ async function recordOutcome(amountUsdc, success, serviceId) {
   }
 }
 
-// ── x402 helpers ──────────────────────────────────────────────────────────────
+// ── x402 client ───────────────────────────────────────────────────────────────
 
-function buildHttpClient() {
-  const signer = createEd25519Signer(AGENT_SECRET, 'stellar:testnet');
-  const scheme = new ExactStellarScheme(signer, { url: RPC_URL });
-  const x402 = new x402Client().register('stellar:*', scheme);
-  return new x402HTTPClient(x402);
+const httpClient = buildHttpClient();
+
+export function dispose() {
+  logger.info('Shutting down Lodestar Agent');
 }
 
 const STROOPS_PER_USDC = 10_000_000;
@@ -174,6 +171,33 @@ function usdcStrToStroops(usdcStr) {
   return BigInt(Math.round(parseFloat(usdcStr) * STROOPS_PER_USDC));
 }
 
+function buildHttpClient() {
+  const signer = createEd25519Signer(AGENT_SECRET, 'stellar:testnet');
+  const scheme = new ExactStellarScheme(signer, { url: RPC_URL });
+  const x402 = new x402Client().register('stellar:*', scheme);
+  const httpClient = new x402HTTPClient(x402);
+
+  // Implement fetch manually — x402HTTPClient.fetch() was removed in this version
+  httpClient.fetch = async (url, init = {}) => {
+    const probe = await fetch(url, init);
+    if (probe.status !== 402) return probe;
+
+    const paymentRequired = httpClient.getPaymentRequiredResponse(
+      (name) => probe.headers.get(name),
+      probe.status === 402 ? await probe.json().catch(() => undefined) : undefined
+    );
+
+    const paymentPayload = await httpClient.createPaymentPayload(paymentRequired);
+    const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
+    return fetch(url, {
+      ...init,
+      headers: { ...(init.headers ?? {}), ...paymentHeaders },
+    });
+  };
+
+  return httpClient;
+}
+
 // ── Registry helpers ──────────────────────────────────────────────────────────
 
 async function fetchServices(category) {
@@ -184,10 +208,6 @@ async function fetchServices(category) {
 }
 
 async function submitReputation(id, positive) {
-  // Identify this agent so the backend/contract can authorize the vote. The
-  // backend only signs for registered demo agents it holds keys for; for other
-  // agents this is best-effort and a 403/cooldown rejection is expected. fetch
-  // only throws on network errors, so check response.ok before assuming success.
   try {
     const res = await fetch(`${LODESTAR_API_URL}/api/reputation/${id}`, {
       method: 'POST',
@@ -195,16 +215,32 @@ async function submitReputation(id, positive) {
       body: JSON.stringify({ positive, agent: AGENT_ADDRESS }),
     });
     if (!res.ok) {
-      logger.debug({ status: res.status }, `${tag()} Reputation vote not applied (best-effort)`);
+      logger.debug({ status: res.status }, 'Reputation vote not applied (best-effort)');
     }
   } catch {
     // Intentionally best-effort — a failed vote must not abort the agent run.
   }
 }
 
+// Weighted random selection: higher reputation = proportionally more likely to be chosen.
+// Falls back to uniform random when all weights are zero.
+function selectWeighted(services) {
+  const weights = services.map(s => Math.max(0, s.reputation));
+  const total = weights.reduce((sum, w) => sum + w, 0);
+  if (total === 0) {
+    return services[Math.floor(Math.random() * services.length)];
+  }
+  let r = Math.random() * total;
+  for (let i = 0; i < services.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return services[i];
+  }
+  return services[services.length - 1];
+}
+
 // ── Agent task ────────────────────────────────────────────────────────────────
 
-export async function runTask(category, buildUrl, scoringEnabled) {
+
   const taskStart = Date.now();
   logger.info({ event: EVENT.TASK_START, category, agentAddress: AGENT_ADDRESS }, 'Task started');
 
@@ -218,59 +254,27 @@ export async function runTask(category, buildUrl, scoringEnabled) {
     return { success: false, priceUsdc: null };
   }
 
-  const best = [...services].sort((a, b) => b.reputation - a.reputation)[0];
-  logger.info(
-    {
-      event: EVENT.SERVICE_SELECTED,
-      category,
-      serviceId: best.id,
-      serviceName: best.name,
-      priceUsdc: best.price_usdc,
-      servicesFound: services.length,
-    },
-    'Service selected'
-  );
 
-
-  if (scoringEnabled) {
-    const check = await checkSpend(demandedUsdc, category);
-    if (!check.allowed) {
-      logger.warn(
-        {
-          event: EVENT.SPEND_CHECK_BLOCKED,
-          category,
-          serviceId: best.id,
-          serviceName: best.name,
-          priceUsdc: best.price_usdc,
-          reason: check.reason,
-        },
-        'Payment blocked by spending policy'
       );
-      return { success: false, priceUsdc: null };
     }
-    logger.info(
-      { event: EVENT.SPEND_CHECK_PASSED, category, serviceId: best.id, serviceName: best.name, priceUsdc: best.price_usdc },
-      'Spending policy check passed'
+
+    const endpointUrl = buildUrl(selected.endpoint);
+    logger.debug(
+      { event: EVENT.TASK_START, category, serviceId: selected.id, endpointUrl },
+      'Sending x402 payment on Stellar'
     );
+
+
+
+    return { success: true, priceUsdc: selected.price_usdc };
   }
 
-
-
-  // Step 4f: encode as header and retry
-  const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
-  let response;
-  try {
-    response = await fetch(endpointUrl, { headers: paymentHeaders });
-  } catch (err) {
-
-  }
-
-  const txHash = response.headers.get('x-payment-transaction') ?? '(no hash)';
-  const data = await response.json();
-
-  await submitReputation(best.id, true);
-
-  return { success: true, priceUsdc: best.price_usdc };
+  const taskDurationMs = Date.now() - taskStart;
+  logger.error(
+    { event: EVENT.PAYMENT_FAILED, category, servicesAttempted: failed.size, taskDurationMs },
+    'All candidate services exhausted'
+  );
+  return { success: false, priceUsdc: null };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -295,7 +299,7 @@ export async function main() {
   let totalUsdcSpent = 0;
 
   for (const { category, buildUrl } of tasks) {
-    const result = await runTask(category, buildUrl, scoringEnabled);
+    const result = await runTask(category, buildUrl, scoringEnabled, httpClient);
     if (result.success) {
       successCount++;
       totalUsdcSpent += parseFloat(result.priceUsdc ?? '0');
@@ -330,6 +334,8 @@ export async function main() {
 // ── Entry point guard ─────────────────────────────────────────────────────────
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  process.on('SIGTERM', () => { dispose(); process.exit(0); });
+  process.on('SIGINT',  () => { dispose(); process.exit(0); });
   main().catch((err) => {
     logger.error({ err }, 'Agent crashed');
     process.exit(1);

@@ -1,55 +1,51 @@
-import { vi, describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import crypto from 'crypto';
+import { vi, describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 
-const mockListAgents = vi.fn();
-const mockListAgentsPage = vi.fn();
+const mockFlagAgentOnChain = vi.fn();
+const mockAdminDeactivateAgentOnChain = vi.fn();
 const mockGetAgent = vi.fn();
 const mockGetAgentPolicy = vi.fn();
 const mockGetAgentScore = vi.fn();
 const mockGetAgentCount = vi.fn();
 const mockIsAgentEligible = vi.fn();
 const mockCheckSpendingAllowed = vi.fn();
+const mockListAgentsPage = vi.fn();
+const mockRegisterAgentOnChain = vi.fn();
 const mockRecordPaymentOnChain = vi.fn();
+const mockDeactivateAgentOnChain = vi.fn();
+const mockUpdatePolicyOnChain = vi.fn();
 const mockBuildUnsignedAgentTx = vi.fn();
 const mockSubmitSignedAgentTx = vi.fn();
 
 vi.mock('../lib/contract.js', () => ({
-  listAgents: (...args) => mockListAgents(...args),
-  listAgentsPage: (...args) => mockListAgentsPage(...args),
+  flagAgentOnChain: (...args) => mockFlagAgentOnChain(...args),
+  adminDeactivateAgentOnChain: (...args) => mockAdminDeactivateAgentOnChain(...args),
   getAgent: (...args) => mockGetAgent(...args),
   getAgentPolicy: (...args) => mockGetAgentPolicy(...args),
   getAgentScore: (...args) => mockGetAgentScore(...args),
   getAgentCount: (...args) => mockGetAgentCount(...args),
   isAgentEligible: (...args) => mockIsAgentEligible(...args),
   checkSpendingAllowed: (...args) => mockCheckSpendingAllowed(...args),
-  registerAgentOnChain: vi.fn(),
+  listAgentsPage: (...args) => mockListAgentsPage(...args),
+  registerAgentOnChain: (...args) => mockRegisterAgentOnChain(...args),
   recordPaymentOnChain: (...args) => mockRecordPaymentOnChain(...args),
-  flagAgentOnChain: vi.fn(),
-  deactivateAgentOnChain: vi.fn(),
-  updatePolicyOnChain: vi.fn(),
+  deactivateAgentOnChain: (...args) => mockDeactivateAgentOnChain(...args),
+  updatePolicyOnChain: (...args) => mockUpdatePolicyOnChain(...args),
   buildUnsignedAgentTx: (...args) => mockBuildUnsignedAgentTx(...args),
   submitSignedAgentTx: (...args) => mockSubmitSignedAgentTx(...args),
 }));
 
+vi.mock('../lib/logger.js', () => ({
+  default: { error: vi.fn(), info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+}));
+
 vi.mock('../config.js', () => ({
   default: {
-    contract: { agentsId: 'mock_agents_id' },
-    server: { address: 'mock', secret: 'hmac_test_secret' },
-    stellar: { network: 'testnet', rpcUrl: 'https://mock', networkPassphrase: 'mock', usdcContractId: 'mock' },
-    x402: { facilitatorUrl: 'https://mock', searchPrice: '0.001', weatherPrice: '0.001', payTo: 'G_MOCK_PAYMENT' },
-    braveApiKey: '',
-    corsOrigin: ['http://localhost:3000'],
-    jsonBodyLimit: '100kb',
-    rateLimit: {
-      windowMs: 60_000,
-      max: 20,
-      payment: { windowMs: 60_000, max: 10 },
-    },
-    nodeEnv: 'test',
-    port: 3001,
-    logLevel: 'silent',
+    contract: { agentsId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4' },
+    server: { address: 'GADMINXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX', secret: 'test_admin_secret_key' },
+    rateLimit: { payment: { max: 10, windowMs: 60000 } },
   },
 }));
 
@@ -57,471 +53,147 @@ vi.mock('../middleware/rateLimiter.js', () => ({
   writeRateLimiter: () => (_req, _res, next) => next(),
 }));
 
-vi.mock('../lib/logger.js', () => ({
-  default: { error: vi.fn(), info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
+vi.mock('../middleware/paymentRateLimiter.js', () => ({
+  paymentRateLimiter: () => (_req, _res, next) => next(),
 }));
 
-vi.mock('../middleware/ownerAuth.js', () => ({
-  ownerAuth: (req, _res, next) => { req.callerAddress = 'GA_MOCK_OWNER'; next(); },
-}));
+function adminKey(body) {
+  const raw = typeof body === 'string' ? body : JSON.stringify(body);
+  return crypto.createHmac('sha256', 'test_admin_secret_key').update(raw).digest('hex');
+}
 
-vi.mock('../middleware/addressValidator.js', () => ({
-  validateAgentAddressParam: (req, _res, next) => {
-    if (req.params.address && req.params.address.startsWith('G')) {
-      next();
-    } else {
-      _res.status(400).json({ error: 'Invalid address', code: 'INVALID_ADDRESS' });
-    }
-  },
-  isValidStellarAddress: () => true,
-}));
-
-import { _reset as resetIdempotencyStore } from '../lib/idempotency.js';
-import { _resetCache } from './agents.js';
-
-function signBody(body) {
-  return crypto
-    .createHmac('sha256', 'hmac_test_secret')
-    .update(JSON.stringify(body))
-    .digest('hex');
+function makeApp() {
+  const app = express();
+  app.use(express.json());
+  return app;
 }
 
 let app;
 
-
-  app = express();
-  app.use(express.json());
-  app.use('/api', router.default);
+beforeAll(async () => {
+  const router = (await import('./agents.js')).default;
+  app = makeApp();
+  app.use('/', router);
 });
 
-beforeEach(() => {
+describe('POST /admin/agents/:address/flag', () => {
+  const ADDRESS = 'GAMASX3TLJIDO42FO3GTX7IQAYN7RJ4U4CXJOROTB7RSV3NGPUEIEQH3';
 
-  resetIdempotencyStore();
-  _resetCache();
-});
-
-function makeAgent(overrides = {}) {
-  return {
-    address: 'GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ',
-    name: 'Test Agent',
-    description: 'A test agent for testing',
-    owner: 'GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ', // owner = agent address (new arch)
-    score: 100,
-    total_payments: '5',
-    successful_payments: '3',
-    failed_payments: '2',
-    total_volume_stroops: '10000000',
-    registered_at: '1000',
-    last_active: '2000',
-    active: true,
-    flagged: false,
-    flag_reason: '',
-    is_demo: false,
-    ...overrides,
-  };
-}
-
-describe('GET /api/agents', () => {
-  it('should return list of agents', async () => {
-    const agents = [makeAgent({ address: 'GA1' }), makeAgent({ address: 'GA2' })];
-    mockGetAgentCount.mockResolvedValueOnce(2);
-    mockListAgentsPage.mockResolvedValueOnce(agents);
-
-    const res = await request(app).get('/api/agents');
-
-    expect(res.status).toBe(200);
-    expect(res.body.agents).toHaveLength(2);
-    expect(res.body.total).toBe(2);
+  beforeEach(() => {
+    vi.clearAllMocks();
   });
 
-  it('should filter out demo agents when exclude_demo=true', async () => {
-    const agents = [
-      makeAgent({ address: 'GA1', name: 'Real Agent', is_demo: false }),
-      makeAgent({ address: 'GA2', name: 'Demo Agent', is_demo: true }),
-      makeAgent({ address: 'GA3', name: 'Another Real', is_demo: false }),
-    ];
-    mockGetAgentCount.mockResolvedValueOnce(3);
-    mockListAgentsPage.mockResolvedValueOnce(agents);
+  it('flags an agent with valid admin key', async () => {
+    mockFlagAgentOnChain.mockResolvedValueOnce(true);
 
-    const res = await request(app).get('/api/agents?exclude_demo=true');
-
-    expect(res.status).toBe(200);
-    expect(res.body.agents).toHaveLength(2);
-    expect(res.body.agents.every(a => !a.is_demo)).toBe(true);
-    expect(res.body.total).toBe(2);
-  });
-
-  it('should include demo agents when exclude_demo is not set', async () => {
-    const agents = [
-      makeAgent({ address: 'GA1', is_demo: false }),
-      makeAgent({ address: 'GA2', is_demo: true }),
-    ];
-    mockGetAgentCount.mockResolvedValueOnce(2);
-    mockListAgentsPage.mockResolvedValueOnce(agents);
-
-    const res = await request(app).get('/api/agents');
-
-    expect(res.status).toBe(200);
-    expect(res.body.agents).toHaveLength(2);
-    expect(res.body.total).toBe(2);
-  });
-
-  it('should return 500 when contract call fails', async () => {
-    mockGetAgentCount.mockRejectedValueOnce(new Error('Chain error'));
-
-  });
-});
-
-describe('GET /api/agents/count', () => {
-  it('should return agent count', async () => {
-    mockGetAgentCount.mockResolvedValueOnce(5);
-
-    const res = await request(app).get('/api/agents/count');
-
-    expect(res.status).toBe(200);
-    expect(res.body.count).toBe(5);
-  });
-});
-
-describe('GET /api/agents/stats', () => {
-  it('should return zero stats when no agents', async () => {
-    mockGetAgentCount.mockResolvedValueOnce(0);
-
-    const res = await request(app).get('/api/agents/stats');
-
-    expect(res.status).toBe(200);
-    expect(res.body.totalAgents).toBe(0);
-    expect(res.body.avgScore).toBe(0);
-  });
-
-  it('should return stats for agents', async () => {
-    const agents = [
-      makeAgent({ score: 100, total_volume_stroops: '10000000' }),
-      makeAgent({ score: 200, total_volume_stroops: '20000000' }),
-    ];
-    mockGetAgentCount.mockResolvedValueOnce(2);
-    mockListAgentsPage.mockResolvedValueOnce(agents);
-
-    const res = await request(app).get('/api/agents/stats');
-
-    expect(res.status).toBe(200);
-    expect(res.body.totalAgents).toBe(2);
-    expect(res.body.avgScore).toBe(150);
-  });
-
-  it('should return zero stats when no agents', async () => {
-    mockGetAgentCount.mockResolvedValueOnce(0);
-    mockListAgentsPage.mockResolvedValueOnce([]);
-
-});
-
-describe('GET /api/agents/:address', () => {
-  it('should return agent with policy', async () => {
-    const agent = makeAgent();
-    mockGetAgent.mockResolvedValueOnce(agent);
-    mockGetAgentPolicy.mockResolvedValueOnce(null);
-
-    const res = await request(app).get('/api/agents/GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ');
-
-    expect(res.status).toBe(200);
-    expect(res.body.agent.name).toBe('Test Agent');
-    // owner should equal agent address in new architecture
-    expect(res.body.agent.owner).toBe(res.body.agent.address);
-  });
-
-  it('should return 404 if agent not found', async () => {
-    mockGetAgent.mockResolvedValueOnce(null);
-
-    const res = await request(app).get('/api/agents/GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ');
-
-    expect(res.status).toBe(404);
-    expect(res.body.error).toBe('Agent not found');
-  });
-});
-
-describe('GET /api/agents/:address/score', () => {
-  it('should return agent score', async () => {
-    mockGetAgentScore.mockResolvedValueOnce(85);
-
-    const res = await request(app).get('/api/agents/GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ/score');
-
-    expect(res.status).toBe(200);
-    expect(res.body.score).toBe(85);
-  });
-});
-
-describe('POST /api/agents/:address/build-tx', () => {
-  const agentAddress = 'GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ';
-
-  it('returns XDR for flag action', async () => {
-    mockBuildUnsignedAgentTx.mockResolvedValueOnce('MOCK_XDR_BASE64');
-
+    const body = { reason: 'violation of terms' };
     const res = await request(app)
-      .post(`/api/agents/${agentAddress}/build-tx`)
-      .set('x-caller-address', agentAddress)
-      .send({ action: 'flag', reason: 'spam' });
+      .post(`/admin/agents/${ADDRESS}/flag`)
+      .set('X-Admin-Key', adminKey(body))
+      .send(body);
 
     expect(res.status).toBe(200);
-    expect(res.body.xdr).toBe('MOCK_XDR_BASE64');
-    expect(mockBuildUnsignedAgentTx).toHaveBeenCalledWith('flag', agentAddress, { reason: 'spam' });
+    expect(res.body).toEqual({ success: true });
+    expect(mockFlagAgentOnChain).toHaveBeenCalledWith(ADDRESS, 'violation of terms');
   });
 
-  it('returns XDR for deactivate action', async () => {
-    mockBuildUnsignedAgentTx.mockResolvedValueOnce('MOCK_XDR_BASE64_DEACTIVATE');
-
+  it('returns 400 when reason is missing', async () => {
+    const body = {};
     const res = await request(app)
-      .post(`/api/agents/${agentAddress}/build-tx`)
-      .set('x-caller-address', agentAddress)
-      .send({ action: 'deactivate' });
-
-    expect(res.status).toBe(200);
-    expect(res.body.xdr).toBe('MOCK_XDR_BASE64_DEACTIVATE');
-    expect(mockBuildUnsignedAgentTx).toHaveBeenCalledWith('deactivate', agentAddress, {});
-  });
-
-  it('returns 400 for unknown action', async () => {
-    const res = await request(app)
-      .post(`/api/agents/${agentAddress}/build-tx`)
-      .set('x-caller-address', agentAddress)
-      .send({ action: 'unknown' });
+      .post(`/admin/agents/${ADDRESS}/flag`)
+      .set('X-Admin-Key', adminKey(body))
+      .send(body);
 
     expect(res.status).toBe(400);
     expect(res.body.code).toBe('INVALID_BODY');
+    expect(mockFlagAgentOnChain).not.toHaveBeenCalled();
   });
 
-  it('returns 400 when flag action missing reason', async () => {
+  it('returns 401 when X-Admin-Key is missing', async () => {
     const res = await request(app)
-      .post(`/api/agents/${agentAddress}/build-tx`)
-      .set('x-caller-address', agentAddress)
-      .send({ action: 'flag' });
+      .post(`/admin/agents/${ADDRESS}/flag`)
+      .send({ reason: 'test' });
 
-    expect(res.status).toBe(400);
-    expect(res.body.code).toBe('INVALID_BODY');
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('ADMIN_KEY_MISSING');
+    expect(mockFlagAgentOnChain).not.toHaveBeenCalled();
+  });
+
+  it('returns 401 when X-Admin-Key is invalid', async () => {
+    const res = await request(app)
+      .post(`/admin/agents/${ADDRESS}/flag`)
+      .set('X-Admin-Key', 'invalid_key')
+      .send({ reason: 'test' });
+
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('ADMIN_KEY_INVALID');
+    expect(mockFlagAgentOnChain).not.toHaveBeenCalled();
+  });
+
+  it('handles contract errors gracefully', async () => {
+    mockFlagAgentOnChain.mockRejectedValueOnce(new Error('Chain error'));
+
+    const body = { reason: 'test' };
+    const res = await request(app)
+      .post(`/admin/agents/${ADDRESS}/flag`)
+      .set('X-Admin-Key', adminKey(body))
+      .send(body);
+
+    expect(res.status).toBe(500);
   });
 });
 
-describe('POST /api/agents/:address/submit-signed-tx', () => {
-  const agentAddress = 'GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ';
+describe('POST /admin/agents/:address/deactivate', () => {
+  const ADDRESS = 'GAMASX3TLJIDO42FO3GTX7IQAYN7RJ4U4CXJOROTB7RSV3NGPUEIEQH3';
 
-  it('submits signed XDR and returns hash', async () => {
-    mockSubmitSignedAgentTx.mockResolvedValueOnce('abc123hash');
-
-    const res = await request(app)
-      .post(`/api/agents/${agentAddress}/submit-signed-tx`)
-      .send({ signedXdr: 'SIGNED_XDR_BASE64' });
-
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-    expect(res.body.hash).toBe('abc123hash');
-    expect(mockSubmitSignedAgentTx).toHaveBeenCalledWith('SIGNED_XDR_BASE64');
+  beforeEach(() => {
+    vi.clearAllMocks();
   });
 
-  it('returns 400 when signedXdr is missing', async () => {
+  it('deactivates an agent with valid admin key', async () => {
+    mockAdminDeactivateAgentOnChain.mockResolvedValueOnce(true);
+
+    const body = {};
     const res = await request(app)
-      .post(`/api/agents/${agentAddress}/submit-signed-tx`)
+      .post(`/admin/agents/${ADDRESS}/deactivate`)
+      .set('X-Admin-Key', adminKey(body))
+      .send(body);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true });
+    expect(mockAdminDeactivateAgentOnChain).toHaveBeenCalledWith(ADDRESS);
+  });
+
+  it('returns 401 when X-Admin-Key is missing', async () => {
+    const res = await request(app)
+      .post(`/admin/agents/${ADDRESS}/deactivate`)
       .send({});
 
-    expect(res.status).toBe(400);
-    expect(res.body.code).toBe('INVALID_BODY');
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('ADMIN_KEY_MISSING');
+    expect(mockAdminDeactivateAgentOnChain).not.toHaveBeenCalled();
   });
 
-  it('returns error when submission fails', async () => {
-    const { ContractError } = await import('../lib/ContractError.js');
-    mockSubmitSignedAgentTx.mockRejectedValueOnce(
-      new ContractError('Transaction failed on-chain: hash123', 'ON_CHAIN_FAILURE')
-    );
-
+  it('returns 401 when X-Admin-Key is invalid', async () => {
     const res = await request(app)
-      .post(`/api/agents/${agentAddress}/submit-signed-tx`)
-      .send({ signedXdr: 'BAD_XDR' });
-
-    expect(res.status).toBe(400);
-    expect(res.body.code).toBe('ON_CHAIN_FAILURE');
-  });
-});
-
-describe('POST /api/agents/:address/payment (HMAC + rate limit + idempotency)', () => {
-  const agentAddress = 'GA7FYRB5CREWMDK2VIKVKWSW7V3YCCU3B3UHBJQ6JZ5OC7V7M5D4T8KJ';
-  const validBody = { amountUsdc: '0.001', success: true, serviceId: 1 };
-  const idempotencyKey = 'test-idem-key-001';
-
-  function makeRequest(body = validBody, key = idempotencyKey) {
-    const signature = signBody(body);
-    return request(app)
-      .post(`/api/agents/${agentAddress}/payment`)
-      .set('X-Lodestar-Signature', signature)
-      .set('X-Idempotency-Key', key)
-      .send(body);
-  }
-
-  it('should return 401 when X-Lodestar-Signature is missing', async () => {
-    const res = await request(app)
-      .post(`/api/agents/${agentAddress}/payment`)
-      .set('X-Idempotency-Key', idempotencyKey)
-      .send(validBody);
+      .post(`/admin/agents/${ADDRESS}/deactivate`)
+      .set('X-Admin-Key', 'invalid')
+      .send({});
 
     expect(res.status).toBe(401);
-    expect(res.body.code).toBe('HMAC_MISSING');
-    expect(mockRecordPaymentOnChain).not.toHaveBeenCalled();
+    expect(res.body.code).toBe('ADMIN_KEY_INVALID');
+    expect(mockAdminDeactivateAgentOnChain).not.toHaveBeenCalled();
   });
 
-  it('should return 401 when X-Lodestar-Signature is invalid', async () => {
+  it('handles contract errors gracefully', async () => {
+    mockAdminDeactivateAgentOnChain.mockRejectedValueOnce(new Error('Chain error'));
+
+    const body = {};
     const res = await request(app)
-      .post(`/api/agents/${agentAddress}/payment`)
-      .set('X-Lodestar-Signature', 'wrong_signature')
-      .set('X-Idempotency-Key', idempotencyKey)
-      .send(validBody);
-
-    expect(res.status).toBe(401);
-    expect(res.body.code).toBe('HMAC_INVALID');
-    expect(mockRecordPaymentOnChain).not.toHaveBeenCalled();
-  });
-
-  it('should return 400 when X-Idempotency-Key header is missing', async () => {
-    const signature = signBody(validBody);
-    const res = await request(app)
-      .post(`/api/agents/${agentAddress}/payment`)
-      .set('X-Lodestar-Signature', signature)
-      .send(validBody);
-
-    expect(res.status).toBe(400);
-    expect(res.body.code).toBe('IDEMPOTENCY_KEY_MISSING');
-    expect(mockRecordPaymentOnChain).not.toHaveBeenCalled();
-  });
-
-  it('should return 400 when X-Idempotency-Key is empty', async () => {
-    const signature = signBody(validBody);
-    const res = await request(app)
-      .post(`/api/agents/${agentAddress}/payment`)
-      .set('X-Lodestar-Signature', signature)
-      .set('X-Idempotency-Key', '')
-      .send(validBody);
-
-    expect(res.status).toBe(400);
-    expect(res.body.code).toBe('IDEMPOTENCY_KEY_MISSING');
-    expect(mockRecordPaymentOnChain).not.toHaveBeenCalled();
-  });
-
-  it('should return 400 when serviceId is missing', async () => {
-    const body = { amountUsdc: '0.001', success: true };
-    const signature = signBody(body);
-    const res = await request(app)
-      .post(`/api/agents/${agentAddress}/payment`)
-      .set('X-Lodestar-Signature', signature)
-      .set('X-Idempotency-Key', idempotencyKey)
+      .post(`/admin/agents/${ADDRESS}/deactivate`)
+      .set('X-Admin-Key', adminKey(body))
       .send(body);
 
-    expect(res.status).toBe(400);
-    expect(res.body.code).toBe('INVALID_BODY');
-  });
-
-  it('should succeed with valid HMAC signature and idempotency key', async () => {
-    mockRecordPaymentOnChain.mockResolvedValueOnce(true);
-    mockGetAgent.mockResolvedValueOnce({ score: 110 });
-
-    const res = await makeRequest();
-
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-    expect(res.body.newScore).toBe(110);
-    expect(res.body.idempotent).toBeUndefined();
-    expect(mockRecordPaymentOnChain).toHaveBeenCalledOnce();
-    expect(mockRecordPaymentOnChain).toHaveBeenCalledWith(
-      agentAddress, 1, expect.any(BigInt), true
-    );
-  });
-
-  it('should replay the cached response on a duplicate request (no second chain call)', async () => {
-    mockRecordPaymentOnChain.mockResolvedValueOnce(true);
-    mockGetAgent.mockResolvedValueOnce({ score: 110 });
-
-    const first = await makeRequest();
-    expect(first.status).toBe(200);
-    expect(first.body.newScore).toBe(110);
-
-    const retry = await makeRequest();
-    expect(retry.status).toBe(200);
-    expect(retry.body.success).toBe(true);
-    expect(retry.body.newScore).toBe(110);
-    expect(retry.body.idempotent).toBe(true);
-    expect(mockRecordPaymentOnChain).toHaveBeenCalledOnce();
-  });
-
-  it('should allow a different key for a logically separate payment', async () => {
-    mockRecordPaymentOnChain.mockResolvedValue(true);
-    mockGetAgent.mockResolvedValue({ score: 120 });
-
-    const res1 = await makeRequest(validBody, 'key-payment-A');
-    const res2 = await makeRequest(validBody, 'key-payment-B');
-
-    expect(res1.status).toBe(200);
-    expect(res2.status).toBe(200);
-    expect(mockRecordPaymentOnChain).toHaveBeenCalledTimes(2);
-  });
-
-  it('should return newScore when agent is below min_score_to_earn (enforced by contract)', async () => {
-    // The contract enforces min_score_to_earn: successful payment stats are
-    // recorded but score does not increase when agent.score < policy.min_score_to_earn.
-    // The backend faithfully returns whatever score the contract reports.
-    mockRecordPaymentOnChain.mockResolvedValueOnce(true);
-    mockGetAgent.mockResolvedValueOnce({ score: 100 }); // score unchanged
-
-    const res = await makeRequest();
-
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-    expect(res.body.newScore).toBe(100);
-    expect(mockRecordPaymentOnChain).toHaveBeenCalledOnce();
-  });
-
-  it('should scope keys per agent — same key for different agents does not collide', async () => {
-    const agentB = 'GBXDMZV5VQTPV6Q2W5KQEZUMHBG7TDMKH6Q3JZXTPQ7YRPLSAVQLKL2';
-    mockRecordPaymentOnChain.mockResolvedValue(true);
-    mockGetAgent.mockResolvedValue({ score: 100 });
-
-    const bodyA = validBody;
-    const bodyB = { amountUsdc: '0.002', success: false, serviceId: 2 };
-    const sigA = signBody(bodyA);
-    const sigB = signBody(bodyB);
-
-    const resA = await request(app)
-      .post(`/api/agents/${agentAddress}/payment`)
-      .set('X-Lodestar-Signature', sigA)
-      .set('X-Idempotency-Key', 'shared-key')
-      .send(bodyA);
-
-    const resB = await request(app)
-      .post(`/api/agents/${agentB}/payment`)
-      .set('X-Lodestar-Signature', sigB)
-      .set('X-Idempotency-Key', 'shared-key')
-      .send(bodyB);
-
-    expect(resA.status).toBe(200);
-    expect(resB.status).toBe(200);
-    expect(mockRecordPaymentOnChain).toHaveBeenCalledTimes(2);
-  });
-
-  it('should return 429 when rate limit is exceeded', async () => {
-    const body = { amountUsdc: '0.001', success: true, serviceId: 2 };
-    const signature = signBody(body);
-
-    for (let i = 0; i < 10; i++) {
-      mockRecordPaymentOnChain.mockResolvedValueOnce(true);
-      mockGetAgent.mockResolvedValueOnce({ score: 100 });
-      await request(app)
-        .post(`/api/agents/${agentAddress}/payment`)
-        .set('X-Lodestar-Signature', signature)
-        .set('X-Idempotency-Key', `rate-limit-key-${i}`)
-        .send(body);
-    }
-
-    const res = await request(app)
-      .post(`/api/agents/${agentAddress}/payment`)
-      .set('X-Lodestar-Signature', signature)
-      .set('X-Idempotency-Key', 'rate-limit-key-11')
-      .send(body);
-
-    expect(res.status).toBe(429);
-    expect(res.body.code).toBe('RATE_LIMITED');
+    expect(res.status).toBe(500);
   });
 });

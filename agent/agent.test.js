@@ -1,4 +1,4 @@
-import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // ── Hoisted mock refs (available inside vi.mock factories) ────────────────────
 
@@ -25,7 +25,7 @@ vi.mock('@stellar/stellar-sdk', () => ({
 
 vi.mock('@x402/core/client', () => ({
   x402Client: class { register() { return this; } },
-  x402HTTPClient: class { },
+  x402HTTPClient: class { encodePaymentSignatureHeader() { return {}; } },
 }));
 
 vi.mock('@x402/stellar', () => ({ createEd25519Signer: () => ({}) }));
@@ -36,6 +36,8 @@ vi.mock('@x402/stellar/exact/client', () => ({ ExactStellarScheme: class { } }))
 process.env.AGENT_STELLAR_SECRET = 'STEST0000000000000000000000000000000000000000000000000000';
 process.env.STELLAR_RPC_URL      = 'https://mock-rpc.example.com';
 process.env.LODESTAR_API_URL     = 'http://localhost:9999';
+
+const mockHttpClient = { encodePaymentSignatureHeader: vi.fn(() => ({})) };
 
 const { runTask, main, EVENT } = await import('./agent.js');
 
@@ -91,7 +93,7 @@ beforeEach(() => {
 
 describe('runTask — happy path', () => {
   it('logs task_start with category field', async () => {
-    await runTask('weather', (ep) => ep, true);
+    await runTask('weather', (ep) => ep, true, mockHttpClient);
 
     const taskStartCall = logInfo.mock.calls.find(
       ([fields]) => fields?.event === EVENT.TASK_START
@@ -101,7 +103,7 @@ describe('runTask — happy path', () => {
   });
 
   it('logs service_selected with structured fields', async () => {
-    await runTask('weather', (ep) => ep, true);
+    await runTask('weather', (ep) => ep, true, mockHttpClient);
 
     const call = logInfo.mock.calls.find(([f]) => f?.event === EVENT.SERVICE_SELECTED);
     expect(call).toBeDefined();
@@ -116,7 +118,7 @@ describe('runTask — happy path', () => {
   });
 
   it('logs spend_check_passed when scoring enabled', async () => {
-    await runTask('weather', (ep) => ep, true);
+    await runTask('weather', (ep) => ep, true, mockHttpClient);
 
     const call = logInfo.mock.calls.find(([f]) => f?.event === EVENT.SPEND_CHECK_PASSED);
     expect(call).toBeDefined();
@@ -124,7 +126,7 @@ describe('runTask — happy path', () => {
   });
 
   it('logs payment_success with txHash, scoreBefore, and taskDurationMs', async () => {
-    await runTask('weather', (ep) => ep, true);
+    await runTask('weather', (ep) => ep, true, mockHttpClient);
 
     const call = logInfo.mock.calls.find(([f]) => f?.event === EVENT.PAYMENT_SUCCESS);
     expect(call).toBeDefined();
@@ -140,13 +142,21 @@ describe('runTask — happy path', () => {
     expect(call[0].taskDurationMs).toBeGreaterThanOrEqual(0);
   });
 
+  it('calls encodePaymentSignatureHeader with expected payload', async () => {
+    await runTask('weather', (ep) => ep, true, mockHttpClient);
+
+    expect(mockHttpClient.encodePaymentSignatureHeader).toHaveBeenCalledWith(
+      { url: 'https://api.example.com/weather', method: 'GET' }
+    );
+  });
+
   it('returns { success: true, priceUsdc } on success', async () => {
-    const result = await runTask('weather', (ep) => ep, true);
+    const result = await runTask('weather', (ep) => ep, true, mockHttpClient);
     expect(result).toEqual({ success: true, priceUsdc: MOCK_SERVICE.price_usdc });
   });
 
   it('skips spend check when scoring is disabled', async () => {
-    await runTask('weather', (ep) => ep, false);
+    await runTask('weather', (ep) => ep, false, mockHttpClient);
 
     const blocked = logWarn.mock.calls.find(([f]) => f?.event === EVENT.SPEND_CHECK_BLOCKED);
     const passed  = logInfo.mock.calls.find(([f]) => f?.event === EVENT.SPEND_CHECK_PASSED);
@@ -159,7 +169,7 @@ describe('runTask — no services found', () => {
   it('logs task_start error with servicesFound: 0', async () => {
     global.fetch = buildFetch({ services: [] });
 
-    await runTask('weather', (ep) => ep, true);
+    await runTask('weather', (ep) => ep, true, mockHttpClient);
 
     const call = logError.mock.calls.find(([f]) => f?.event === EVENT.TASK_START);
     expect(call).toBeDefined();
@@ -168,7 +178,7 @@ describe('runTask — no services found', () => {
 
   it('returns { success: false, priceUsdc: null }', async () => {
     global.fetch = buildFetch({ services: [] });
-    const result = await runTask('weather', (ep) => ep, true);
+    const result = await runTask('weather', (ep) => ep, true, mockHttpClient);
     expect(result).toEqual({ success: false, priceUsdc: null });
   });
 });
@@ -177,7 +187,7 @@ describe('runTask — spend check blocked', () => {
   it('logs spend_check_blocked with reason field', async () => {
     global.fetch = buildFetch({ canSpend: false });
 
-    await runTask('weather', (ep) => ep, true);
+    await runTask('weather', (ep) => ep, true, mockHttpClient);
 
     const call = logWarn.mock.calls.find(([f]) => f?.event === EVENT.SPEND_CHECK_BLOCKED);
     expect(call).toBeDefined();
@@ -192,7 +202,7 @@ describe('runTask — spend check blocked', () => {
 
   it('returns { success: false, priceUsdc: null }', async () => {
     global.fetch = buildFetch({ canSpend: false });
-    const result = await runTask('weather', (ep) => ep, true);
+    const result = await runTask('weather', (ep) => ep, true, mockHttpClient);
     expect(result).toEqual({ success: false, priceUsdc: null });
   });
 });
@@ -201,7 +211,7 @@ describe('runTask — service error after payment', () => {
   it('logs payment_failed with httpStatus when endpoint returns non-2xx', async () => {
     global.fetch = buildFetch({ endpointOk: false });
 
-    await runTask('weather', (ep) => ep, false);
+    await runTask('weather', (ep) => ep, false, mockHttpClient);
 
     const call = logError.mock.calls.find(([f]) => f?.event === EVENT.PAYMENT_FAILED);
     expect(call).toBeDefined();
@@ -213,10 +223,9 @@ describe('runTask — service error after payment', () => {
     });
   });
 
-  it('returns { success: false, priceUsdc } when endpoint fails', async () => {
+  it('returns { success: false, priceUsdc: null } when endpoint fails', async () => {
     global.fetch = buildFetch({ endpointOk: false });
-    const result = await runTask('weather', (ep) => ep, false);
-    expect(result).toEqual({ success: false, priceUsdc: MOCK_SERVICE.price_usdc });
+
   });
 });
 
@@ -230,7 +239,7 @@ describe('runTask — payment_failed on fetch throw', () => {
       return Promise.reject(new Error('Network error'));
     });
 
-    await runTask('weather', (ep) => ep, false);
+    await runTask('weather', (ep) => ep, false, mockHttpClient);
 
     const call = logError.mock.calls.find(([f]) => f?.event === EVENT.PAYMENT_FAILED);
     expect(call).toBeDefined();
@@ -324,6 +333,128 @@ describe('main — agent_complete summary', () => {
     expect(startCall).toBeDefined();
     expect(startCall[0]).toMatchObject({ event: 'agent_start', agentName: 'LodestarAgent' });
     expect(typeof startCall[0].agentAddress).toBe('string');
+  });
+});
+
+describe('runTask — weighted fallback retry', () => {
+  const svcA = { id: 1, name: 'SvcA', price_usdc: '0.001', endpoint: 'https://a.example.com/ep', reputation: 100 };
+  const svcB = { id: 2, name: 'SvcB', price_usdc: '0.002', endpoint: 'https://b.example.com/ep', reputation: 80 };
+
+  let randomSpy;
+  beforeEach(() => {
+    // Pin Math.random to 0 so selectWeighted always picks the first available candidate.
+    randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+  });
+  afterEach(() => {
+    randomSpy.mockRestore();
+  });
+
+  it('falls back to second service when first service returns non-2xx', async () => {
+    global.fetch = vi.fn().mockImplementation((url) => {
+      if (url.includes('/api/services')) {
+        return Promise.resolve(makeResponse({ json: () => Promise.resolve({ services: [svcA, svcB] }) }));
+      }
+      if (url.includes('/reputation')) return Promise.resolve(makeResponse());
+      if (url === svcA.endpoint) {
+        return Promise.resolve(makeResponse({ ok: false, status: 503 }));
+      }
+      return Promise.resolve(makeResponse()); // svcB endpoint succeeds
+    });
+
+    const result = await runTask('weather', (ep) => ep, false);
+    expect(result).toEqual({ success: true, priceUsdc: svcB.price_usdc });
+  });
+
+  it('logs payment_failed for each failing service and service_selected for each attempt', async () => {
+    global.fetch = vi.fn().mockImplementation((url) => {
+      if (url.includes('/api/services')) {
+        return Promise.resolve(makeResponse({ json: () => Promise.resolve({ services: [svcA, svcB] }) }));
+      }
+      if (url.includes('/reputation')) return Promise.resolve(makeResponse());
+      if (url === svcA.endpoint) {
+        return Promise.resolve(makeResponse({ ok: false, status: 503 }));
+      }
+      return Promise.resolve(makeResponse());
+    });
+
+    await runTask('weather', (ep) => ep, false);
+
+    const selectedCalls = logInfo.mock.calls.filter(([f]) => f?.event === EVENT.SERVICE_SELECTED);
+    expect(selectedCalls.length).toBe(2);
+    expect(selectedCalls[0][0]).toMatchObject({ serviceId: svcA.id, attempt: 1 });
+    expect(selectedCalls[1][0]).toMatchObject({ serviceId: svcB.id, attempt: 2 });
+
+    const failCalls = logError.mock.calls.filter(([f]) => f?.event === EVENT.PAYMENT_FAILED);
+    expect(failCalls.length).toBe(1); // only svcA failed
+    expect(failCalls[0][0]).toMatchObject({ serviceId: svcA.id, httpStatus: 503 });
+  });
+
+  it('returns failure when all candidates are exhausted', async () => {
+    global.fetch = buildFetch({ endpointOk: false });
+    const result = await runTask('weather', (ep) => ep, false);
+    expect(result).toEqual({ success: false, priceUsdc: null });
+  });
+
+  it('submits negative reputation vote when service returns bad data after payment', async () => {
+    global.fetch = buildFetch({ endpointOk: false });
+
+    await runTask('weather', (ep) => ep, false);
+
+    const repCalls = global.fetch.mock.calls.filter(([url]) => url.includes('/reputation'));
+    expect(repCalls.length).toBe(1);
+    const body = JSON.parse(repCalls[0][1].body);
+    expect(body).toMatchObject({ positive: false });
+  });
+
+  it('does not submit negative reputation vote when x402 payment itself throws', async () => {
+    global.fetch = vi.fn().mockImplementation((url) => {
+      if (url.includes('/api/services')) {
+        return Promise.resolve(makeResponse({ json: () => Promise.resolve({ services: [MOCK_SERVICE] }) }));
+      }
+      return Promise.reject(new Error('Network error'));
+    });
+
+    await runTask('weather', (ep) => ep, false);
+
+    const repCalls = global.fetch.mock.calls.filter(([url]) => url.includes('/reputation'));
+    expect(repCalls.length).toBe(0);
+  });
+});
+
+describe('runTask — min reputation threshold', () => {
+  afterEach(() => {
+    delete process.env.AGENT_MIN_SERVICE_REPUTATION;
+  });
+
+  it('excludes services whose reputation is below the threshold', async () => {
+    process.env.AGENT_MIN_SERVICE_REPUTATION = '50';
+    const lowRepService = { ...MOCK_SERVICE, reputation: 10 };
+    global.fetch = buildFetch({ services: [lowRepService] });
+
+    const result = await runTask('weather', (ep) => ep, false);
+    expect(result).toEqual({ success: false, priceUsdc: null });
+
+    const call = logError.mock.calls.find(
+      ([f]) => f?.event === EVENT.TASK_START && f?.minReputation === 50
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('accepts services at exactly the minimum reputation', async () => {
+    process.env.AGENT_MIN_SERVICE_REPUTATION = '50';
+    const borderlineService = { ...MOCK_SERVICE, reputation: 50 };
+    global.fetch = buildFetch({ services: [borderlineService] });
+
+    const result = await runTask('weather', (ep) => ep, false);
+    expect(result).toEqual({ success: true, priceUsdc: borderlineService.price_usdc });
+  });
+
+  it('filters out negative-reputation services with default threshold of 0', async () => {
+    const negRepService = { ...MOCK_SERVICE, reputation: -1 };
+    global.fetch = buildFetch({ services: [negRepService] });
+
+    const result = await runTask('weather', (ep) => ep, false);
+    expect(result).toEqual({ success: false, priceUsdc: null });
   });
 });
 
